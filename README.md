@@ -1,50 +1,109 @@
-# Welcome to your Expo app 👋
+# 🎮 Jogo de Turismo de Oeiras - Piauí
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+Um site/aplicativo interativo que combina mapa real com jogo 2D! Explore os pontos turísticos de Oeiras caminhando com um personagem pelo mapa da cidade como se fosse um jogo.
 
-## Get started
+## 🎯 Recursos Principais
 
-1. Install dependencies
+- 🗺️ **Mapa Interativo**: Mapa em tempo real de Oeiras usando OpenStreetMap
+- 🧑‍🚀 **Personagem Controlável**: Controle um personagem que caminha pelas ruas reais
+- 📍 **Pontos Turísticos**: 6+ pontos turísticos com informações detalhadas
+- 🏆 **Sistema de Medalhas**: Desbloqueie medalhas ao explorar
+- 📱 **Responsivo**: Funciona em web, Android e iOS
+- ⌨️ **Controles Simples**: WASD ou Setas para mover
 
-   ```bash
-   npm install
-   ```
+## 🛠️ Instalação
 
-2. Start the app
-
-   ```bash
-   npx expo start
-   ```
-
-In the output, you'll find options to open the app in a
-
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
-
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
-
-## Get a fresh project
-
-When you're ready, run:
-
+1. **Instalar dependências**
 ```bash
-npm run reset-project
+npm install
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+2. **Iniciar o desenvolvimento**
+```bash
+npm start
+```
 
-## Learn more
+Para abrir em diferentes plataformas:
+- Web: Pressione `w` no terminal
+- Android: Pressione `a` no terminal
+- iOS: Pressione `i` no terminal
 
-To learn more about developing your project with Expo, look at the following resources:
+## 🎮 Como Jogar
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+1. Abra a tela "Explore"
+2. Use os controles para mover seu personagem:
+   - **W** ou **↑**: Mover para cima
+   - **A** ou **←**: Mover para esquerda
+   - **S** ou **↓**: Mover para baixo
+   - **D** ou **→**: Mover para direita
 
-## Join the community
+3. Aproxime-se dos pontos turísticos (ícones coloridos)
+4. Clique nos pontos para ver informações
+5. Colete medalhas explorando todos os locais
 
-Join our community of developers creating universal apps.
+## 📍 Pontos Turísticos de Oeiras
 
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+- ⛪ Igreja Matriz de Oeiras
+- 🏞️ Praça Pública de Oeiras
+- 📚 Biblioteca Municipal
+- 💧 Rio Oeiras
+- 🏛️ Prefeitura Municipal
+- 🛒 Mercado Público
+
+## 🏆 Sistema de Medalhas
+
+Desbloqueie medalhas por:
+- 👣 Primeiro Passo: Visite o primeiro ponto turístico
+- 🗺️ Explorador: Visite todos os pontos turísticos
+- 📖 Apaixonado por História: Aprenda sobre a história de Oeiras
+- 🎭 Amante da Cultura: Visite todos os pontos culturais
+
+## 📦 Tecnologias Utilizadas
+
+- **React Native**: Framework para desenvolvimento multi-plataforma
+- **Expo**: Plataforma para React Native
+- **Leaflet.js**: Biblioteca de mapas interativos
+- **React Leaflet**: Componentes React para Leaflet
+- **OpenStreetMap**: Dados de mapa gratuitos
+- **TypeScript**: Tipagem estática
+- **React Native Reanimated**: Animações fluidas
+
+## 🎨 Estrutura do Projeto
+
+```
+jogo-turismo-oeiras/
+├── app/
+│   ├── (tabs)/
+│   │   ├── explore.tsx          # Tela principal do jogo
+│   │   ├── index.tsx            # Home
+│   │   └── _layout.tsx
+│   ├── data/
+│   │   └── touristicPoints.ts   # Dados dos pontos turísticos
+│   ├── _layout.tsx
+│   └── globals.css
+├── components/
+│   ├── InteractiveMap.tsx       # Componente do mapa
+│   └── BadgesDisplay.tsx        # Sistema de medalhas
+├── constants/
+├── hooks/
+└── package.json
+```
+
+## 🚀 Próximas Melhorias
+
+- [ ] Adicionar áudio ao visitar pontos turísticos
+- [ ] Sistema de fotos antigas dos pontos turísticos
+- [ ] Mais pontos turísticos
+- [ ] Temas diferentes para o mapa
+- [ ] Sistema de ranking
+- [ ] Modo multiplayer
+- [ ] Histórias interativas em cada ponto
+
+## 📝 Licença
+
+MIT
+
+## 👨‍💻 Desenvolvedor
+
+Criado com ❤️ para a cidade de Oeiras, Piauí
+

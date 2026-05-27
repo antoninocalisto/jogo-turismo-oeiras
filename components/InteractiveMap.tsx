@@ -1,5 +1,14 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Animated, Modal, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import {
+  ActivityIndicator,
+  Animated,
+  Image,
+  Modal,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
 import { touristicPoints, TouristicPoint } from '@/data/touristicPoints';
 
 interface PlayerPosition {
@@ -17,6 +26,10 @@ const INITIAL_PLAYER_POSITION: PlayerPosition = {
   lng: -42.1311325,
 };
 const INTERACTION_DISTANCE_METERS = 35;
+const PREFETCH_FRAME_COUNT = 10;
+const MAPILLARY_SEARCH_RADIUS_DEGREES = 0.025;
+const TURN_STEP_DEGREES = 10;
+const MOVE_SUBSTEPS = 3;
 
 const distanceInMeters = (start: PlayerPosition, point: [number, number]) => {
   const earthRadius = 6371000;
@@ -35,15 +48,63 @@ const distanceInMeters = (start: PlayerPosition, point: [number, number]) => {
 const headingDifference = (first: number, second: number) =>
   Math.abs(((first - second + 540) % 360) - 180);
 
+const getStreetLinks = (links?: (google.maps.StreetViewLink | null)[] | null) =>
+  (links ?? []).filter(
+    (link): link is google.maps.StreetViewLink & { pano: string; heading: number } =>
+      Boolean(link?.pano) && typeof link?.heading === 'number'
+  );
+
+const getClosestStreetLink = (
+  links: (google.maps.StreetViewLink & { pano: string; heading: number })[],
+  desiredHeading: number
+) =>
+  links.reduce((best, candidate) =>
+    headingDifference(candidate.heading, desiredHeading) <
+    headingDifference(best.heading, desiredHeading)
+      ? candidate
+      : best
+  );
+
+type ViewProvider = 'loading' | 'google' | 'mapillary';
+
+interface MapillaryFrame {
+  id: string;
+  imageUrl: string;
+  sequence?: string;
+  lat: number;
+  lng: number;
+  heading: number;
+  creator?: string;
+}
+
 export const InteractiveMap: React.FC<InteractiveMapProps> = ({
   onPointVisited,
   onBadgeUnlocked,
 }) => {
   const panoramaContainerRef = useRef<any>(null);
   const panoramaRef = useRef<google.maps.StreetViewPanorama | null>(null);
+  const streetViewServiceRef = useRef<google.maps.StreetViewService | null>(null);
+  const panoramaCacheRef = useRef<Map<string, google.maps.StreetViewPanoramaData>>(new Map());
+  const panoramaRequestsRef = useRef<Map<string, Promise<google.maps.StreetViewPanoramaData | null>>>(
+    new Map()
+  );
+  const moveSubstepRef = useRef({ direction: 0, count: 0 });
+  const pendingMoveRef = useRef(false);
+  const transitionTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const walkAnimation = useRef(new Animated.Value(0)).current;
+  const motionOpacity = useRef(new Animated.Value(0)).current;
+  const motionScale = useRef(new Animated.Value(1)).current;
+  const sceneScale = useRef(new Animated.Value(1)).current;
+  const sceneShift = useRef(new Animated.Value(0)).current;
+  const aiBlend = useRef(new Animated.Value(0)).current;
   const [streetViewReady, setStreetViewReady] = useState(false);
   const [streetViewError, setStreetViewError] = useState<string | null>(null);
+  const [viewProvider, setViewProvider] = useState<ViewProvider>('loading');
+  const [mapillaryFrames, setMapillaryFrames] = useState<MapillaryFrame[]>([]);
+  const [currentFrameIndex, setCurrentFrameIndex] = useState(0);
+  const [previousFrameUrl, setPreviousFrameUrl] = useState<string | null>(null);
+  const [isMoving, setIsMoving] = useState(false);
+  const [movementHint, setMovementHint] = useState<string | null>(null);
   const [playerPosition, setPlayerPosition] = useState<PlayerPosition>(INITIAL_PLAYER_POSITION);
   const [hasWalked, setHasWalked] = useState(false);
   const [visitedPoints, setVisitedPoints] = useState<Set<string>>(new Set());
@@ -51,27 +112,402 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
   const [nearbyPoints, setNearbyPoints] = useState<Set<string>>(new Set());
   const [score, setScore] = useState(0);
 
+  const activeMapillaryFrame = mapillaryFrames[currentFrameIndex];
+
   const animateWalk = useCallback(() => {
     walkAnimation.setValue(0);
     Animated.sequence([
-      Animated.timing(walkAnimation, { toValue: 1, duration: 140, useNativeDriver: false }),
-      Animated.timing(walkAnimation, { toValue: 0, duration: 140, useNativeDriver: false }),
+      Animated.timing(walkAnimation, {
+        toValue: 1,
+        duration: 180,
+        useNativeDriver: false,
+      }),
+      Animated.timing(walkAnimation, {
+        toValue: 0,
+        duration: 180,
+        useNativeDriver: false,
+      }),
     ]).start();
   }, [walkAnimation]);
 
-  useEffect(() => {
-    const apiKey = process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY;
-    let active = true;
-    let positionListener: google.maps.MapsEventListener | undefined;
+  const loadPanoramaData = useCallback(async (pano: string) => {
+    const cached = panoramaCacheRef.current.get(pano);
+    if (cached) {
+      return cached;
+    }
 
-    if (!apiKey) {
-      setStreetViewError(
-        'Defina EXPO_PUBLIC_GOOGLE_MAPS_API_KEY para ativar o passeio Street View.'
-      );
+    const existingRequest = panoramaRequestsRef.current.get(pano);
+    if (existingRequest) {
+      return existingRequest;
+    }
+
+    const service = streetViewServiceRef.current;
+    if (!service) {
+      return null;
+    }
+
+    const request = service
+      .getPanorama({ pano })
+      .then((response) => {
+        panoramaCacheRef.current.set(pano, response.data);
+        return response.data;
+      })
+      .catch(() => null)
+      .finally(() => {
+        panoramaRequestsRef.current.delete(pano);
+      });
+
+    panoramaRequestsRef.current.set(pano, request);
+    return request;
+  }, []);
+
+  const prefetchRouteAhead = useCallback(
+    async (startPano: string, desiredHeading: number, depth = PREFETCH_FRAME_COUNT) => {
+      let nextPano = startPano;
+      let nextHeading = desiredHeading;
+
+      for (let step = 0; step < depth; step += 1) {
+        const data = await loadPanoramaData(nextPano);
+        const links = getStreetLinks(data?.links);
+
+        if (!links.length) {
+          return;
+        }
+
+        const route = getClosestStreetLink(links, nextHeading);
+        if (panoramaCacheRef.current.has(route.pano)) {
+          nextPano = route.pano;
+          nextHeading = route.heading;
+          continue;
+        }
+
+        await loadPanoramaData(route.pano);
+        nextPano = route.pano;
+        nextHeading = route.heading;
+      }
+    },
+    [loadPanoramaData]
+  );
+
+  const prefetchPanoramaNeighborhood = useCallback(
+    async (originPano: string, desiredHeading: number, frameCount = PREFETCH_FRAME_COUNT) => {
+      const visited = new Set<string>([originPano]);
+      const queue: { pano: string; heading: number }[] = [{ pano: originPano, heading: desiredHeading }];
+      let prefetchedFrames = 0;
+
+      while (queue.length && prefetchedFrames < frameCount) {
+        const current = queue.shift();
+        if (!current) {
+          return;
+        }
+
+        const data = await loadPanoramaData(current.pano);
+        const links = getStreetLinks(data?.links).sort(
+          (first, second) =>
+            headingDifference(first.heading, current.heading) -
+            headingDifference(second.heading, current.heading)
+        );
+
+        for (const link of links) {
+          if (visited.has(link.pano) || prefetchedFrames >= frameCount) {
+            continue;
+          }
+
+          visited.add(link.pano);
+          prefetchedFrames += 1;
+          queue.push({ pano: link.pano, heading: link.heading });
+          void loadPanoramaData(link.pano);
+        }
+      }
+    },
+    [loadPanoramaData]
+  );
+
+  const prefetchVisibleRoutes = useCallback(() => {
+    const panorama = panoramaRef.current;
+    if (!panorama) {
       return;
     }
 
+    const links = getStreetLinks(panorama.getLinks());
+    const heading = panorama.getPov().heading;
+    const currentPano = panorama.getPano();
+
+    links.forEach((link) => {
+      void loadPanoramaData(link.pano);
+    });
+
+    if (currentPano) {
+      void prefetchPanoramaNeighborhood(currentPano, heading);
+    }
+
+    if (links.length) {
+      const forwardRoute = getClosestStreetLink(links, heading);
+      const backwardRoute = getClosestStreetLink(links, heading + 180);
+      void prefetchRouteAhead(forwardRoute.pano, forwardRoute.heading, PREFETCH_FRAME_COUNT);
+      void prefetchRouteAhead(backwardRoute.pano, backwardRoute.heading, 4);
+    }
+  }, [loadPanoramaData, prefetchPanoramaNeighborhood, prefetchRouteAhead]);
+
+  const prefetchMapillaryFrames = useCallback(
+    (centerIndex: number, frames = mapillaryFrames) => {
+      const start = Math.max(0, centerIndex - PREFETCH_FRAME_COUNT);
+      const end = Math.min(frames.length, centerIndex + PREFETCH_FRAME_COUNT + 1);
+
+      frames.slice(start, end).forEach((frame) => {
+        void Image.prefetch(frame.imageUrl);
+      });
+    },
+    [mapillaryFrames]
+  );
+
+  const loadMapillaryWalk = useCallback(async (accessToken: string) => {
+    const bbox = [
+      INITIAL_PLAYER_POSITION.lng - MAPILLARY_SEARCH_RADIUS_DEGREES,
+      INITIAL_PLAYER_POSITION.lat - MAPILLARY_SEARCH_RADIUS_DEGREES,
+      INITIAL_PLAYER_POSITION.lng + MAPILLARY_SEARCH_RADIUS_DEGREES,
+      INITIAL_PLAYER_POSITION.lat + MAPILLARY_SEARCH_RADIUS_DEGREES,
+    ].join(',');
+    const params = new URLSearchParams({
+      access_token: accessToken,
+      bbox,
+      limit: '80',
+      fields:
+        'id,thumb_2048_url,computed_geometry,computed_compass_angle,sequence,creator,is_pano',
+    });
+    const response = await fetch(`https://graph.mapillary.com/images?${params.toString()}`);
+
+    if (!response.ok) {
+      return [];
+    }
+
+    const payload = (await response.json()) as {
+      data?: {
+        id?: string;
+        thumb_2048_url?: string;
+        computed_geometry?: { coordinates?: [number, number] };
+        computed_compass_angle?: number;
+        sequence?: string;
+        creator?: { username?: string };
+      }[];
+    };
+    const frames = (payload.data ?? [])
+      .map((item): MapillaryFrame | null => {
+        const coordinates = item.computed_geometry?.coordinates;
+        if (!item.id || !item.thumb_2048_url || !coordinates) {
+          return null;
+        }
+
+        return {
+          id: item.id,
+          imageUrl: item.thumb_2048_url,
+          sequence: item.sequence,
+          lat: coordinates[1],
+          lng: coordinates[0],
+          heading: item.computed_compass_angle ?? 0,
+          creator: item.creator?.username,
+        };
+      })
+      .filter((frame): frame is MapillaryFrame => Boolean(frame));
+
+    const sequenceCounts = frames.reduce<Record<string, number>>((counts, frame) => {
+      if (!frame.sequence) {
+        return counts;
+      }
+
+      counts[frame.sequence] = (counts[frame.sequence] ?? 0) + 1;
+      return counts;
+    }, {});
+    const bestSequence = Object.entries(sequenceCounts).sort((first, second) => second[1] - first[1])[0]?.[0];
+    const sequenceFrames = bestSequence
+      ? frames.filter((frame) => frame.sequence === bestSequence)
+      : frames;
+
+    return sequenceFrames
+      .sort(
+        (first, second) =>
+          distanceInMeters(INITIAL_PLAYER_POSITION, [first.lat, first.lng]) -
+          distanceInMeters(INITIAL_PLAYER_POSITION, [second.lat, second.lng])
+      )
+      .slice(0, 60);
+  }, []);
+
+  const finishPanoramaTransition = useCallback(() => {
+    if (transitionTimeoutRef.current) {
+      clearTimeout(transitionTimeoutRef.current);
+      transitionTimeoutRef.current = null;
+    }
+
+    pendingMoveRef.current = false;
+    Animated.parallel([
+      Animated.timing(motionOpacity, {
+        toValue: 0,
+        duration: 220,
+        useNativeDriver: false,
+      }),
+      Animated.timing(sceneScale, {
+        toValue: 1,
+        duration: 220,
+        useNativeDriver: false,
+      }),
+      Animated.timing(sceneShift, {
+        toValue: 0,
+        duration: 220,
+        useNativeDriver: false,
+      }),
+      Animated.timing(aiBlend, {
+        toValue: 0,
+        duration: 220,
+        useNativeDriver: false,
+      }),
+    ]).start(() => setIsMoving(false));
+  }, [aiBlend, motionOpacity, sceneScale, sceneShift]);
+
+  const startPanoramaTransition = useCallback(
+    (reverse = false) => {
+      setIsMoving(true);
+      setMovementHint(reverse ? 'Voltando...' : 'Avancando...');
+      motionOpacity.setValue(0);
+      motionScale.setValue(1);
+      aiBlend.setValue(0);
+      walkAnimation.setValue(0);
+      Animated.parallel([
+        Animated.loop(
+          Animated.sequence([
+            Animated.timing(walkAnimation, {
+              toValue: 1,
+              duration: 80,
+              useNativeDriver: false,
+            }),
+            Animated.timing(walkAnimation, {
+              toValue: 0,
+              duration: 80,
+              useNativeDriver: false,
+            }),
+          ]),
+          { iterations: 5 }
+        ),
+        Animated.timing(motionOpacity, {
+          toValue: 1,
+          duration: 140,
+          useNativeDriver: false,
+        }),
+        Animated.timing(motionScale, {
+          toValue: 1.014,
+          duration: 620,
+          useNativeDriver: false,
+        }),
+        Animated.timing(sceneScale, {
+          toValue: 1.018,
+          duration: 620,
+          useNativeDriver: false,
+        }),
+        Animated.timing(sceneShift, {
+          toValue: reverse ? -1 : 1,
+          duration: 620,
+          useNativeDriver: false,
+        }),
+        Animated.sequence([
+          Animated.timing(aiBlend, {
+            toValue: 1,
+            duration: 180,
+            useNativeDriver: false,
+          }),
+          Animated.timing(aiBlend, {
+            toValue: 0.35,
+            duration: 420,
+            useNativeDriver: false,
+          }),
+        ]),
+      ]).start();
+
+      if (transitionTimeoutRef.current) {
+        clearTimeout(transitionTimeoutRef.current);
+      }
+
+      transitionTimeoutRef.current = setTimeout(() => {
+        finishPanoramaTransition();
+      }, 1400);
+    },
+    [aiBlend, finishPanoramaTransition, motionOpacity, motionScale, sceneScale, sceneShift, walkAnimation]
+  );
+
+  const playMicroStep = useCallback(
+    (reverse = false, currentSubstep: number) => {
+      const progress = currentSubstep / MOVE_SUBSTEPS;
+      const direction = reverse ? -1 : 1;
+
+      setIsMoving(true);
+      setMovementHint(`${reverse ? 'Voltando' : 'Avancando'} ${currentSubstep}/${MOVE_SUBSTEPS}`);
+      motionOpacity.setValue(0.35);
+      motionScale.setValue(1);
+      aiBlend.setValue(0.25);
+      walkAnimation.setValue(0);
+
+      Animated.parallel([
+        Animated.sequence([
+          Animated.timing(walkAnimation, {
+            toValue: 1,
+            duration: 90,
+            useNativeDriver: false,
+          }),
+          Animated.timing(walkAnimation, {
+            toValue: 0,
+            duration: 90,
+            useNativeDriver: false,
+          }),
+        ]),
+        Animated.timing(sceneScale, {
+          toValue: 1 + progress * 0.018,
+          duration: 210,
+          useNativeDriver: false,
+        }),
+        Animated.timing(sceneShift, {
+          toValue: direction * progress,
+          duration: 210,
+          useNativeDriver: false,
+        }),
+        Animated.sequence([
+          Animated.timing(motionOpacity, {
+            toValue: 0.52,
+            duration: 70,
+            useNativeDriver: false,
+          }),
+          Animated.timing(motionOpacity, {
+            toValue: 0,
+            duration: 160,
+            useNativeDriver: false,
+          }),
+        ]),
+        Animated.timing(aiBlend, {
+          toValue: 0,
+          duration: 230,
+          useNativeDriver: false,
+        }),
+      ]).start(() => {
+        setIsMoving(false);
+        setMovementHint(null);
+      });
+    },
+    [aiBlend, motionOpacity, motionScale, sceneScale, sceneShift, walkAnimation]
+  );
+
+  useEffect(() => {
+    const apiKey = process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY;
+    const mapillaryToken = process.env.EXPO_PUBLIC_MAPILLARY_ACCESS_TOKEN;
+    const panoramaCache = panoramaCacheRef.current;
+    const panoramaRequests = panoramaRequestsRef.current;
+    let active = true;
+    let positionListener: google.maps.MapsEventListener | undefined;
+
     const startStreetView = async () => {
+      if (!apiKey) {
+        setStreetViewError(
+          'Defina EXPO_PUBLIC_GOOGLE_MAPS_API_KEY ou EXPO_PUBLIC_MAPILLARY_ACCESS_TOKEN para ativar o passeio.'
+        );
+        return;
+      }
+
       try {
         const { importLibrary, setOptions } = await import('@googlemaps/js-api-loader');
         setOptions({ key: apiKey, v: 'weekly', language: 'pt-BR', region: 'BR' });
@@ -79,6 +515,7 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
         const { StreetViewPanorama, StreetViewPreference, StreetViewService, StreetViewSource } =
           await importLibrary('streetView');
         const service = new StreetViewService();
+        streetViewServiceRef.current = service;
         const response = await service.getPanorama({
           location: INITIAL_PLAYER_POSITION,
           preference: StreetViewPreference.NEAREST,
@@ -108,6 +545,8 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
         });
 
         panoramaRef.current = panorama;
+        panoramaCacheRef.current.set(response.data.location.pano, response.data);
+        setViewProvider('google');
         positionListener = panorama.addListener('position_changed', () => {
           const location = panorama.getPosition();
           if (!location) {
@@ -116,8 +555,15 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
 
           setPlayerPosition({ lat: location.lat(), lng: location.lng() });
           animateWalk();
+
+          if (pendingMoveRef.current) {
+            finishPanoramaTransition();
+          }
+
+          prefetchVisibleRoutes();
         });
         setStreetViewReady(true);
+        prefetchVisibleRoutes();
       } catch {
         if (active) {
           setStreetViewError(
@@ -127,41 +573,176 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
       }
     };
 
-    startStreetView();
+    const startWalkProvider = async () => {
+      if (mapillaryToken) {
+        const frames = await loadMapillaryWalk(mapillaryToken);
+
+        if (active && frames.length >= 3) {
+          setMapillaryFrames(frames);
+          setCurrentFrameIndex(0);
+          setPreviousFrameUrl(null);
+          setPlayerPosition({ lat: frames[0].lat, lng: frames[0].lng });
+          setViewProvider('mapillary');
+          setStreetViewReady(true);
+          prefetchMapillaryFrames(0, frames);
+          return;
+        }
+      }
+
+      await startStreetView();
+    };
+
+    startWalkProvider();
 
     return () => {
       active = false;
+      if (transitionTimeoutRef.current) {
+        clearTimeout(transitionTimeoutRef.current);
+      }
       positionListener?.remove();
       panoramaRef.current?.setVisible(false);
       panoramaRef.current = null;
+      streetViewServiceRef.current = null;
+      panoramaCache.clear();
+      panoramaRequests.clear();
     };
-  }, [animateWalk]);
+  }, [
+    animateWalk,
+    finishPanoramaTransition,
+    loadMapillaryWalk,
+    prefetchMapillaryFrames,
+    prefetchVisibleRoutes,
+  ]);
 
-  const moveOnStreet = useCallback((reverse = false) => {
+  const moveOnStreet = useCallback(async (reverse = false) => {
+    if (isMoving) {
+      return;
+    }
+
+    if (viewProvider === 'mapillary') {
+      const direction = reverse ? -1 : 1;
+      const nextIndex = reverse
+        ? Math.max(0, currentFrameIndex - 1)
+        : Math.min(mapillaryFrames.length - 1, currentFrameIndex + 1);
+
+      if (nextIndex === currentFrameIndex) {
+        setMovementHint('Nao ha proximo frame nessa direcao.');
+        setTimeout(() => setMovementHint(null), 1600);
+        return;
+      }
+
+      const nextSubstep =
+        moveSubstepRef.current.direction === direction ? moveSubstepRef.current.count + 1 : 1;
+      moveSubstepRef.current = { direction, count: nextSubstep };
+
+      if (nextSubstep < MOVE_SUBSTEPS) {
+        playMicroStep(reverse, nextSubstep);
+        return;
+      }
+
+      moveSubstepRef.current = { direction: 0, count: 0 };
+      const currentFrame = mapillaryFrames[currentFrameIndex];
+      const nextFrame = mapillaryFrames[nextIndex];
+      pendingMoveRef.current = true;
+      setPreviousFrameUrl(currentFrame?.imageUrl ?? null);
+      startPanoramaTransition(reverse);
+      setHasWalked(true);
+      prefetchMapillaryFrames(nextIndex);
+
+      window.setTimeout(() => {
+        setCurrentFrameIndex(nextIndex);
+        setPlayerPosition({ lat: nextFrame.lat, lng: nextFrame.lng });
+      }, 130);
+
+      window.setTimeout(() => {
+        finishPanoramaTransition();
+        setPreviousFrameUrl(null);
+      }, 720);
+      return;
+    }
+
     const panorama = panoramaRef.current;
-    const links = (panorama?.getLinks() ?? []).filter(
-      (link): link is google.maps.StreetViewLink & { pano: string; heading: number } =>
-        Boolean(link?.pano) && typeof link?.heading === 'number'
-    );
+    const links = getStreetLinks(panorama?.getLinks());
     if (!panorama || !links?.length) {
+      setMovementHint('Nao ha proximo panorama nessa direcao.');
+      setTimeout(() => setMovementHint(null), 1600);
       return;
     }
 
     const currentHeading = panorama.getPov().heading;
     const desiredHeading = reverse ? currentHeading + 180 : currentHeading;
-    const route = links.reduce((best, candidate) =>
-      headingDifference(candidate.heading, desiredHeading) <
-      headingDifference(best.heading, desiredHeading)
-        ? candidate
-        : best
-    );
+    const route = getClosestStreetLink(links, desiredHeading);
+    const direction = reverse ? -1 : 1;
+    const nextSubstep =
+      moveSubstepRef.current.direction === direction ? moveSubstepRef.current.count + 1 : 1;
+    moveSubstepRef.current = { direction, count: nextSubstep };
 
+    if (nextSubstep < MOVE_SUBSTEPS) {
+      playMicroStep(reverse, nextSubstep);
+      return;
+    }
+
+    moveSubstepRef.current = { direction: 0, count: 0 };
+    pendingMoveRef.current = true;
+    startPanoramaTransition(reverse);
     setHasWalked(true);
-    panorama.setPano(route.pano);
-    panorama.setPov({ heading: route.heading, pitch: 0 });
-  }, []);
+    void prefetchRouteAhead(route.pano, route.heading, PREFETCH_FRAME_COUNT);
+    void prefetchPanoramaNeighborhood(route.pano, route.heading, PREFETCH_FRAME_COUNT);
+
+    try {
+      await loadPanoramaData(route.pano);
+      panorama.setPano(route.pano);
+      panorama.setPov({ heading: route.heading, pitch: 0 });
+    } catch {
+      panorama.setPano(route.pano);
+      panorama.setPov({ heading: route.heading, pitch: 0 });
+    }
+  }, [
+    currentFrameIndex,
+    finishPanoramaTransition,
+    isMoving,
+    loadPanoramaData,
+    mapillaryFrames,
+    playMicroStep,
+    prefetchMapillaryFrames,
+    prefetchPanoramaNeighborhood,
+    prefetchRouteAhead,
+    startPanoramaTransition,
+    viewProvider,
+  ]);
 
   const turnView = useCallback((amount: number) => {
+    moveSubstepRef.current = { direction: 0, count: 0 };
+    Animated.parallel([
+      Animated.timing(sceneScale, {
+        toValue: 1,
+        duration: 160,
+        useNativeDriver: false,
+      }),
+      Animated.timing(sceneShift, {
+        toValue: 0,
+        duration: 160,
+        useNativeDriver: false,
+      }),
+    ]).start();
+
+    if (viewProvider === 'mapillary') {
+      const direction = amount > 0 ? 1 : -1;
+      const nextIndex = Math.min(
+        mapillaryFrames.length - 1,
+        Math.max(0, currentFrameIndex + direction)
+      );
+
+      if (nextIndex !== currentFrameIndex) {
+        setPreviousFrameUrl(mapillaryFrames[currentFrameIndex]?.imageUrl ?? null);
+        setCurrentFrameIndex(nextIndex);
+        setPlayerPosition({ lat: mapillaryFrames[nextIndex].lat, lng: mapillaryFrames[nextIndex].lng });
+        prefetchMapillaryFrames(nextIndex);
+        window.setTimeout(() => setPreviousFrameUrl(null), 320);
+      }
+      return;
+    }
+
     const panorama = panoramaRef.current;
     if (!panorama) {
       return;
@@ -169,7 +750,16 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
 
     const view = panorama.getPov();
     panorama.setPov({ heading: view.heading + amount, pitch: view.pitch });
-  }, []);
+    window.setTimeout(prefetchVisibleRoutes, 120);
+  }, [
+    currentFrameIndex,
+    mapillaryFrames,
+    prefetchMapillaryFrames,
+    prefetchVisibleRoutes,
+    sceneScale,
+    sceneShift,
+    viewProvider,
+  ]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -183,10 +773,10 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
         moveOnStreet(true);
       } else if (key === 'a' || key === 'arrowleft') {
         event.preventDefault();
-        turnView(-30);
+        turnView(-TURN_STEP_DEGREES);
       } else if (key === 'd' || key === 'arrowright') {
         event.preventDefault();
-        turnView(30);
+        turnView(TURN_STEP_DEGREES);
       }
     };
 
@@ -228,12 +818,64 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
   const nearbyPoint = touristicPoints.find((point) => nearbyPoints.has(point.id));
   const characterMovement = walkAnimation.interpolate({
     inputRange: [0, 1],
-    outputRange: [0, -8],
+    outputRange: [0, -3],
+  });
+  const bodyLean = walkAnimation.interpolate({
+    inputRange: [0, 0.5, 1],
+    outputRange: ['0deg', '2deg', '0deg'],
+  });
+  const leftLegStep = walkAnimation.interpolate({
+    inputRange: [0, 0.5, 1],
+    outputRange: ['-5deg', '7deg', '-5deg'],
+  });
+  const rightLegStep = walkAnimation.interpolate({
+    inputRange: [0, 0.5, 1],
+    outputRange: ['7deg', '-5deg', '7deg'],
+  });
+  const sceneTranslateY = sceneShift.interpolate({
+    inputRange: [-1, 0, 1],
+    outputRange: [-18, 0, 24],
+  });
+  const pathOpacity = motionOpacity.interpolate({
+    inputRange: [0, 1],
+    outputRange: [0, 0.38],
+  });
+  const aiBlendOpacity = aiBlend.interpolate({
+    inputRange: [0, 1],
+    outputRange: [0, 0.42],
+  });
+  const aiFrameShift = aiBlend.interpolate({
+    inputRange: [0, 1],
+    outputRange: [18, -18],
   });
 
   return (
     <View style={styles.container}>
-      <View ref={panoramaContainerRef} style={styles.panorama} />
+      <Animated.View
+        style={[
+          styles.panoramaFrame,
+          {
+            transform: [{ scale: sceneScale }, { translateY: sceneTranslateY }],
+          },
+        ]}
+      >
+        {viewProvider === 'mapillary' && activeMapillaryFrame ? (
+          <View style={styles.mapillaryScene}>
+            {previousFrameUrl && (
+              <Image source={{ uri: previousFrameUrl }} style={styles.mapillaryImage} />
+            )}
+            <Image source={{ uri: activeMapillaryFrame.imageUrl }} style={styles.mapillaryImage} />
+            <Animated.View style={[styles.mapillaryAiBlend, { opacity: aiBlendOpacity }]} />
+            <View style={styles.mapillaryAttribution}>
+              <Text style={styles.mapillaryAttributionText}>
+                Mapillary CC-BY-SA{activeMapillaryFrame.creator ? ` - ${activeMapillaryFrame.creator}` : ''}
+              </Text>
+            </View>
+          </View>
+        ) : (
+          <View ref={panoramaContainerRef} style={styles.panorama} />
+        )}
+      </Animated.View>
       {!streetViewReady && (
         <View style={styles.loadingContainer}>
           {streetViewError ? (
@@ -247,7 +889,7 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
           ) : (
             <>
               <ActivityIndicator size="large" color="#4ECDC4" />
-              <Text style={styles.loadingText}>Buscando as ruas de Oeiras...</Text>
+              <Text style={styles.loadingText}>Buscando imagens caminhaveis de Oeiras...</Text>
             </>
           )}
         </View>
@@ -257,6 +899,11 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
         <>
           <View style={styles.overlay}>
             <View style={styles.hud}>
+              <Text style={styles.providerText}>
+                {viewProvider === 'mapillary'
+                  ? `Mapillary + IA visual (${mapillaryFrames.length} frames)`
+                  : 'Street View com suavizacao visual'}
+              </Text>
               <Text style={styles.scoreText}>Pontos: {score}</Text>
               <Text style={styles.visitedText}>
                 Visitados: {visitedPoints.size}/{touristicPoints.length}
@@ -273,32 +920,91 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
           </View>
 
           <Animated.View
-            style={[
-              styles.player,
-              { transform: [{ translateY: characterMovement }] },
-            ]}
+            style={[styles.player, { transform: [{ translateY: characterMovement }] }]}
           >
-            <View style={styles.playerHead} />
-            <View style={styles.playerBody} />
+            <Animated.View style={[styles.playerUpper, { transform: [{ rotate: bodyLean }] }]}>
+              <View style={styles.playerHead} />
+              <View style={styles.playerBody} />
+            </Animated.View>
             <View style={styles.playerLegs}>
-              <View style={styles.playerLeg} />
-              <View style={styles.playerLeg} />
+              <Animated.View
+                style={[styles.playerLeg, { transform: [{ rotate: leftLegStep }] }]}
+              />
+              <Animated.View
+                style={[styles.playerLeg, { transform: [{ rotate: rightLegStep }] }]}
+              />
             </View>
+            <View style={styles.playerShadow} />
           </Animated.View>
 
+          {isMoving && (
+            <Animated.View
+              style={[
+                styles.motionOverlay,
+                {
+                  opacity: motionOpacity,
+                  transform: [{ scale: motionScale }],
+                },
+              ]}
+            >
+              <Animated.View style={[styles.roadFocus, { opacity: pathOpacity }]} />
+              <Animated.View
+                style={[
+                  styles.aiInterpolationLayer,
+                  {
+                    opacity: aiBlendOpacity,
+                    transform: [{ translateY: aiFrameShift }],
+                  },
+                ]}
+              >
+                {Array.from({ length: PREFETCH_FRAME_COUNT }).map((_, index) => (
+                  <View
+                    key={index}
+                    style={[
+                      styles.aiFrameLine,
+                      {
+                        opacity: 1 - index * 0.075,
+                        width: `${92 - index * 5}%`,
+                      },
+                    ]}
+                  />
+                ))}
+              </Animated.View>
+              <Animated.View style={[styles.motionVignette, { opacity: motionOpacity }]} />
+              <View style={styles.motionBreath} />
+              <Text style={styles.motionText}>{movementHint}</Text>
+            </Animated.View>
+          )}
+
           <View style={styles.streetControls}>
-            <TouchableOpacity style={styles.controlButton} onPress={() => turnView(-30)}>
+            <TouchableOpacity
+              disabled={isMoving}
+              style={[styles.controlButton, isMoving && styles.disabledButton]}
+              onPress={() => turnView(-TURN_STEP_DEGREES)}
+            >
               <Text style={styles.controlButtonText}>Virar E</Text>
             </TouchableOpacity>
             <View>
-              <TouchableOpacity style={styles.walkButton} onPress={() => moveOnStreet()}>
+              <TouchableOpacity
+                disabled={isMoving}
+                style={[styles.walkButton, isMoving && styles.disabledButton]}
+                onPress={() => moveOnStreet()}
+              >
                 <Text style={styles.controlButtonText}>Andar</Text>
               </TouchableOpacity>
-              <TouchableOpacity style={styles.backButton} onPress={() => moveOnStreet(true)}>
+              <TouchableOpacity
+                disabled={isMoving}
+                style={[styles.backButton, isMoving && styles.disabledButton]}
+                onPress={() => moveOnStreet(true)}
+              >
                 <Text style={styles.backButtonText}>Voltar</Text>
               </TouchableOpacity>
             </View>
-            <TouchableOpacity style={styles.controlButton} onPress={() => turnView(30)}>
+            <TouchableOpacity
+              disabled={isMoving}
+              style={[styles.controlButton, isMoving && styles.disabledButton]}
+              onPress={() => turnView(TURN_STEP_DEGREES)}
+            >
               <Text style={styles.controlButtonText}>Virar D</Text>
             </TouchableOpacity>
           </View>
@@ -347,7 +1053,42 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
 
 const styles = StyleSheet.create({
   container: { flex: 1, width: '100%', height: '100%', position: 'relative' },
+  panoramaFrame: {
+    width: '100%',
+    height: '100%',
+    overflow: 'hidden',
+    backgroundColor: '#101820',
+  },
   panorama: { width: '100%', height: '100%' },
+  mapillaryScene: {
+    width: '100%',
+    height: '100%',
+    backgroundColor: '#101820',
+  },
+  mapillaryImage: {
+    ...StyleSheet.absoluteFillObject,
+    width: '100%',
+    height: '100%',
+    resizeMode: 'cover',
+  },
+  mapillaryAiBlend: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(255, 255, 255, 0.16)',
+  },
+  mapillaryAttribution: {
+    position: 'absolute',
+    left: 8,
+    bottom: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    borderRadius: 8,
+    backgroundColor: 'rgba(0, 0, 0, 0.45)',
+  },
+  mapillaryAttributionText: {
+    color: '#fff',
+    fontSize: 11,
+    fontWeight: 'bold',
+  },
   loadingContainer: {
     ...StyleSheet.absoluteFillObject,
     alignItems: 'center',
@@ -379,6 +1120,12 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     borderRadius: 16,
   },
+  providerText: {
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: 'bold',
+    marginBottom: 6,
+  },
   scoreText: { color: '#FFD93D', fontSize: 16, fontWeight: 'bold', marginBottom: 5 },
   visitedText: { color: '#4ECDC4', fontSize: 14 },
   nearbyButton: {
@@ -392,37 +1139,110 @@ const styles = StyleSheet.create({
   nearbyText: { color: '#283238', fontSize: 14, fontWeight: 'bold' },
   player: {
     position: 'absolute',
-    bottom: 108,
+    bottom: 104,
     left: '50%',
-    marginLeft: -15,
+    marginLeft: -18,
     alignItems: 'center',
     zIndex: 950,
-    opacity: 0.9,
+    opacity: 0.88,
+  },
+  playerUpper: {
+    alignItems: 'center',
   },
   playerHead: {
-    width: 17,
-    height: 17,
-    borderRadius: 9,
+    width: 18,
+    height: 18,
+    borderRadius: 10,
     backgroundColor: '#f2b786',
     borderWidth: 2,
     borderColor: '#27323a',
   },
   playerBody: {
-    width: 26,
-    height: 29,
-    borderRadius: 8,
-    backgroundColor: '#FF6B6B',
+    width: 28,
+    height: 34,
+    borderRadius: 12,
+    backgroundColor: '#f85f64',
     borderWidth: 2,
     borderColor: '#27323a',
   },
-  playerLegs: { flexDirection: 'row', gap: 6 },
+  playerLegs: {
+    flexDirection: 'row',
+    gap: 7,
+    marginTop: -2,
+  },
   playerLeg: {
-    width: 7,
-    height: 17,
-    borderRadius: 4,
+    width: 8,
+    height: 20,
+    borderRadius: 5,
     backgroundColor: '#284b63',
     borderWidth: 1,
     borderColor: '#27323a',
+    transformOrigin: 'top center',
+  },
+  playerShadow: {
+    width: 42,
+    height: 9,
+    borderRadius: 20,
+    marginTop: -2,
+    backgroundColor: 'rgba(0, 0, 0, 0.25)',
+  },
+  motionOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    zIndex: 920,
+    backgroundColor: 'rgba(8, 13, 18, 0.08)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  motionVignette: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(4, 8, 13, 0.22)',
+  },
+  roadFocus: {
+    position: 'absolute',
+    left: '30%',
+    right: '30%',
+    bottom: 48,
+    height: '31%',
+    borderRadius: 999,
+    backgroundColor: 'rgba(255, 255, 255, 0.14)',
+    transform: [{ scaleX: 1.75 }],
+  },
+  aiInterpolationLayer: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 86,
+    height: '44%',
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+  },
+  aiFrameLine: {
+    height: 2,
+    marginTop: 9,
+    borderRadius: 4,
+    backgroundColor: 'rgba(255, 255, 255, 0.45)',
+  },
+  motionBreath: {
+    position: 'absolute',
+    left: '12%',
+    right: '12%',
+    bottom: 88,
+    height: 1,
+    backgroundColor: 'rgba(255, 255, 255, 0.2)',
+  },
+  motionText: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: 'bold',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 16,
+    backgroundColor: 'rgba(0, 0, 0, 0.28)',
+    marginBottom: 120,
   },
   streetControls: {
     position: 'absolute',
@@ -451,6 +1271,9 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(18, 27, 31, 0.82)',
     paddingVertical: 7,
     borderRadius: 10,
+  },
+  disabledButton: {
+    opacity: 0.55,
   },
   controlButtonText: { fontSize: 14, color: '#fff', fontWeight: 'bold' },
   backButtonText: { fontSize: 12, color: '#fff', fontWeight: 'bold' },

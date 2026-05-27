@@ -241,3 +241,24 @@ npx expo start --web -c
 
 No jogo, use `W`/seta para cima para andar pela rua, `S`/seta para baixo para
 retornar e `A`/`D` ou setas laterais para virar a camera.
+
+### Suavizacao da caminhada
+
+O Street View carrega panoramas separados. Para deixar a caminhada mais natural,
+o jogo aplica uma transicao visual local entre um panorama e outro, com fade,
+linhas de movimento e animacao do boneco. Isso mascara a latencia sem modificar
+as imagens do Google.
+
+Evite usar IA para alterar, interpolar ou gerar frames derivados das imagens do
+Street View. Alem de pesar no navegador, isso pode ferir os termos de uso do
+conteudo do Google.
+
+### Modo Mapillary com IA visual
+
+Se `EXPO_PUBLIC_MAPILLARY_ACCESS_TOKEN` estiver definido, o jogo tenta carregar
+imagens de rua do Mapillary antes de usar o Google Street View. Quando encontra
+cobertura, ele usa imagens CC-BY-SA do Mapillary, pre-carrega frames proximos e
+aplica uma camada visual de interpolacao para parecer mais com video.
+
+Se nao houver cobertura do Mapillary em Oeiras ou o token estiver ausente, o jogo
+volta automaticamente para o Street View.

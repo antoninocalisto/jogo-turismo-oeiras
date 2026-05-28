@@ -30,6 +30,8 @@ const PREFETCH_FRAME_COUNT = 10;
 const MAPILLARY_SEARCH_RADIUS_DEGREES = 0.025;
 const TURN_STEP_DEGREES = 10;
 const MOVE_SUBSTEPS = 3;
+const MINI_MAP_SIZE = 168;
+const MINI_MAP_PADDING = 14;
 
 const distanceInMeters = (start: PlayerPosition, point: [number, number]) => {
   const earthRadius = 6371000;
@@ -45,8 +47,25 @@ const distanceInMeters = (start: PlayerPosition, point: [number, number]) => {
   return 2 * earthRadius * Math.atan2(Math.sqrt(calculation), Math.sqrt(1 - calculation));
 };
 
+const bearingToPoint = (start: PlayerPosition, point: [number, number]) => {
+  const toRadians = (degrees: number) => (degrees * Math.PI) / 180;
+  const toDegrees = (radians: number) => (radians * 180) / Math.PI;
+  const lat1 = toRadians(start.lat);
+  const lat2 = toRadians(point[0]);
+  const deltaLng = toRadians(point[1] - start.lng);
+  const y = Math.sin(deltaLng) * Math.cos(lat2);
+  const x =
+    Math.cos(lat1) * Math.sin(lat2) -
+    Math.sin(lat1) * Math.cos(lat2) * Math.cos(deltaLng);
+
+  return (toDegrees(Math.atan2(y, x)) + 360) % 360;
+};
+
 const headingDifference = (first: number, second: number) =>
   Math.abs(((first - second + 540) % 360) - 180);
+
+const signedHeadingDifference = (first: number, second: number) =>
+  ((first - second + 540) % 360) - 180;
 
 const getStreetLinks = (links?: (google.maps.StreetViewLink | null)[] | null) =>
   (links ?? []).filter(
@@ -64,6 +83,57 @@ const getClosestStreetLink = (
       ? candidate
       : best
   );
+
+const getPreferredStreetLink = (
+  links: (google.maps.StreetViewLink & { pano: string; heading: number })[],
+  desiredHeading: number,
+  steeringBias = 0
+) =>
+  links.reduce((best, candidate) => {
+    const scoreLink = (link: google.maps.StreetViewLink & { pano: string; heading: number }) => {
+      const signedDelta = signedHeadingDifference(link.heading, desiredHeading);
+      const sameSideBonus =
+        steeringBias !== 0 && Math.sign(signedDelta) === Math.sign(steeringBias)
+          ? Math.min(Math.abs(steeringBias), 1) * 18
+          : 0;
+      const oppositeSidePenalty =
+        steeringBias !== 0 && Math.sign(signedDelta) === -Math.sign(steeringBias)
+          ? Math.min(Math.abs(steeringBias), 1) * 10
+          : 0;
+
+      return Math.abs(signedDelta) - sameSideBonus + oppositeSidePenalty;
+    };
+
+    return scoreLink(candidate) < scoreLink(best) ? candidate : best;
+  });
+
+const miniMapBounds = touristicPoints.reduce(
+  (bounds, point) => ({
+    minLat: Math.min(bounds.minLat, point.coordinates[0]),
+    maxLat: Math.max(bounds.maxLat, point.coordinates[0]),
+    minLng: Math.min(bounds.minLng, point.coordinates[1]),
+    maxLng: Math.max(bounds.maxLng, point.coordinates[1]),
+  }),
+  {
+    minLat: INITIAL_PLAYER_POSITION.lat,
+    maxLat: INITIAL_PLAYER_POSITION.lat,
+    minLng: INITIAL_PLAYER_POSITION.lng,
+    maxLng: INITIAL_PLAYER_POSITION.lng,
+  }
+);
+
+const projectToMiniMap = (position: PlayerPosition | [number, number]) => {
+  const lat = Array.isArray(position) ? position[0] : position.lat;
+  const lng = Array.isArray(position) ? position[1] : position.lng;
+  const latRange = Math.max(miniMapBounds.maxLat - miniMapBounds.minLat, 0.001);
+  const lngRange = Math.max(miniMapBounds.maxLng - miniMapBounds.minLng, 0.001);
+  const usableSize = MINI_MAP_SIZE - MINI_MAP_PADDING * 2;
+
+  return {
+    left: MINI_MAP_PADDING + ((lng - miniMapBounds.minLng) / lngRange) * usableSize,
+    top: MINI_MAP_SIZE - MINI_MAP_PADDING - ((lat - miniMapBounds.minLat) / latRange) * usableSize,
+  };
+};
 
 type ViewProvider = 'loading' | 'google' | 'mapillary';
 
@@ -89,8 +159,11 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
     new Map()
   );
   const moveSubstepRef = useRef({ direction: 0, count: 0 });
+  const steeringBiasRef = useRef(0);
   const pendingMoveRef = useRef(false);
   const transitionTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const musicAudioRef = useRef<HTMLAudioElement | null>(null);
+  const musicContextRef = useRef<AudioContext | null>(null);
   const walkAnimation = useRef(new Animated.Value(0)).current;
   const motionOpacity = useRef(new Animated.Value(0)).current;
   const motionScale = useRef(new Animated.Value(1)).current;
@@ -111,8 +184,82 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
   const [selectedPoint, setSelectedPoint] = useState<TouristicPoint | null>(null);
   const [nearbyPoints, setNearbyPoints] = useState<Set<string>>(new Set());
   const [score, setScore] = useState(0);
+  const [playerHeading, setPlayerHeading] = useState(0);
+  const [musicEnabled, setMusicEnabled] = useState(false);
 
   const activeMapillaryFrame = mapillaryFrames[currentFrameIndex];
+  const currentMissionPoint =
+    touristicPoints.find((point) => !visitedPoints.has(point.id)) ?? touristicPoints[0];
+  const missionDistance = currentMissionPoint
+    ? Math.round(distanceInMeters(playerPosition, currentMissionPoint.coordinates))
+    : 0;
+  const missionArrowRotation = currentMissionPoint
+    ? signedHeadingDifference(bearingToPoint(playerPosition, currentMissionPoint.coordinates), playerHeading)
+    : 0;
+  const playerMiniMapPosition = projectToMiniMap(playerPosition);
+
+  const stopMissionMusic = useCallback(() => {
+    musicAudioRef.current?.pause();
+    setMusicEnabled(false);
+  }, []);
+
+  const startMissionMusic = useCallback(() => {
+    if (typeof Audio === 'undefined') {
+      return;
+    }
+
+    if (!musicAudioRef.current) {
+      const audio = new Audio('/audio/theme-from-san-andreas.mp3');
+      audio.loop = true;
+      audio.volume = 0.75;
+      musicAudioRef.current = audio;
+    }
+
+    musicAudioRef.current.volume = 0.75;
+    void musicAudioRef.current
+      .play()
+      .then(() => setMusicEnabled(true))
+      .catch(() => setMusicEnabled(false));
+  }, []);
+
+  const toggleMissionMusic = useCallback(() => {
+    if (musicEnabled) {
+      stopMissionMusic();
+      return;
+    }
+
+    startMissionMusic();
+  }, [musicEnabled, startMissionMusic, stopMissionMusic]);
+
+  const playStepSound = useCallback(() => {
+    if (typeof window === 'undefined' || !window.AudioContext) {
+      return;
+    }
+
+    const context = musicContextRef.current ?? new window.AudioContext();
+    if (!musicContextRef.current) {
+      musicContextRef.current = context;
+    }
+
+    void context.resume();
+    const start = context.currentTime + 0.01;
+    const playFoot = (delay: number, frequency: number) => {
+      const oscillator = context.createOscillator();
+      const gain = context.createGain();
+      oscillator.type = 'triangle';
+      oscillator.frequency.setValueAtTime(frequency, start + delay);
+      gain.gain.setValueAtTime(0.0001, start + delay);
+      gain.gain.linearRampToValueAtTime(0.18, start + delay + 0.008);
+      gain.gain.exponentialRampToValueAtTime(0.001, start + delay + 0.075);
+      oscillator.connect(gain);
+      gain.connect(context.destination);
+      oscillator.start(start + delay);
+      oscillator.stop(start + delay + 0.09);
+    };
+
+    playFoot(0, 95);
+    playFoot(0.16, 78);
+  }, []);
 
   const animateWalk = useCallback(() => {
     walkAnimation.setValue(0);
@@ -242,7 +389,7 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
     }
 
     if (links.length) {
-      const forwardRoute = getClosestStreetLink(links, heading);
+      const forwardRoute = getPreferredStreetLink(links, heading, steeringBiasRef.current);
       const backwardRoute = getClosestStreetLink(links, heading + 180);
       void prefetchRouteAhead(forwardRoute.pano, forwardRoute.heading, PREFETCH_FRAME_COUNT);
       void prefetchRouteAhead(backwardRoute.pano, backwardRoute.heading, 4);
@@ -363,80 +510,12 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
     ]).start(() => setIsMoving(false));
   }, [aiBlend, motionOpacity, sceneScale, sceneShift]);
 
-  const startPanoramaTransition = useCallback(
-    (reverse = false) => {
-      setIsMoving(true);
-      setMovementHint(reverse ? 'Voltando...' : 'Avancando...');
-      motionOpacity.setValue(0);
-      motionScale.setValue(1);
-      aiBlend.setValue(0);
-      walkAnimation.setValue(0);
-      Animated.parallel([
-        Animated.loop(
-          Animated.sequence([
-            Animated.timing(walkAnimation, {
-              toValue: 1,
-              duration: 80,
-              useNativeDriver: false,
-            }),
-            Animated.timing(walkAnimation, {
-              toValue: 0,
-              duration: 80,
-              useNativeDriver: false,
-            }),
-          ]),
-          { iterations: 5 }
-        ),
-        Animated.timing(motionOpacity, {
-          toValue: 1,
-          duration: 140,
-          useNativeDriver: false,
-        }),
-        Animated.timing(motionScale, {
-          toValue: 1.014,
-          duration: 620,
-          useNativeDriver: false,
-        }),
-        Animated.timing(sceneScale, {
-          toValue: 1.018,
-          duration: 620,
-          useNativeDriver: false,
-        }),
-        Animated.timing(sceneShift, {
-          toValue: reverse ? -1 : 1,
-          duration: 620,
-          useNativeDriver: false,
-        }),
-        Animated.sequence([
-          Animated.timing(aiBlend, {
-            toValue: 1,
-            duration: 180,
-            useNativeDriver: false,
-          }),
-          Animated.timing(aiBlend, {
-            toValue: 0.35,
-            duration: 420,
-            useNativeDriver: false,
-          }),
-        ]),
-      ]).start();
-
-      if (transitionTimeoutRef.current) {
-        clearTimeout(transitionTimeoutRef.current);
-      }
-
-      transitionTimeoutRef.current = setTimeout(() => {
-        finishPanoramaTransition();
-      }, 1400);
-    },
-    [aiBlend, finishPanoramaTransition, motionOpacity, motionScale, sceneScale, sceneShift, walkAnimation]
-  );
-
   const playMicroStep = useCallback(
-    (reverse = false, currentSubstep: number) => {
+    (reverse = false, currentSubstep: number, onComplete?: () => void) => {
       const progress = currentSubstep / MOVE_SUBSTEPS;
       const direction = reverse ? -1 : 1;
 
+      playStepSound();
       setIsMoving(true);
       setMovementHint(`${reverse ? 'Voltando' : 'Avancando'} ${currentSubstep}/${MOVE_SUBSTEPS}`);
       motionOpacity.setValue(0.35);
@@ -485,11 +564,18 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
           useNativeDriver: false,
         }),
       ]).start(() => {
+        if (onComplete) {
+          onComplete();
+          return;
+        }
+
         setIsMoving(false);
-        setMovementHint(null);
+        if (currentSubstep < MOVE_SUBSTEPS) {
+          setMovementHint(null);
+        }
       });
     },
-    [aiBlend, motionOpacity, motionScale, sceneScale, sceneShift, walkAnimation]
+    [aiBlend, motionOpacity, motionScale, playStepSound, sceneScale, sceneShift, walkAnimation]
   );
 
   useEffect(() => {
@@ -499,6 +585,7 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
     const panoramaRequests = panoramaRequestsRef.current;
     let active = true;
     let positionListener: google.maps.MapsEventListener | undefined;
+    let povListener: google.maps.MapsEventListener | undefined;
 
     const startStreetView = async () => {
       if (!apiKey) {
@@ -547,6 +634,7 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
         panoramaRef.current = panorama;
         panoramaCacheRef.current.set(response.data.location.pano, response.data);
         setViewProvider('google');
+        setPlayerHeading(panorama.getPov().heading);
         positionListener = panorama.addListener('position_changed', () => {
           const location = panorama.getPosition();
           if (!location) {
@@ -561,6 +649,9 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
           }
 
           prefetchVisibleRoutes();
+        });
+        povListener = panorama.addListener('pov_changed', () => {
+          setPlayerHeading(panorama.getPov().heading);
         });
         setStreetViewReady(true);
         prefetchVisibleRoutes();
@@ -582,6 +673,7 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
           setCurrentFrameIndex(0);
           setPreviousFrameUrl(null);
           setPlayerPosition({ lat: frames[0].lat, lng: frames[0].lng });
+          setPlayerHeading(frames[0].heading);
           setViewProvider('mapillary');
           setStreetViewReady(true);
           prefetchMapillaryFrames(0, frames);
@@ -600,11 +692,13 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
         clearTimeout(transitionTimeoutRef.current);
       }
       positionListener?.remove();
+      povListener?.remove();
       panoramaRef.current?.setVisible(false);
       panoramaRef.current = null;
       streetViewServiceRef.current = null;
       panoramaCache.clear();
       panoramaRequests.clear();
+      stopMissionMusic();
     };
   }, [
     animateWalk,
@@ -612,6 +706,7 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
     loadMapillaryWalk,
     prefetchMapillaryFrames,
     prefetchVisibleRoutes,
+    stopMissionMusic,
   ]);
 
   const moveOnStreet = useCallback(async (reverse = false) => {
@@ -637,27 +732,27 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
 
       if (nextSubstep < MOVE_SUBSTEPS) {
         playMicroStep(reverse, nextSubstep);
+        if (nextSubstep === MOVE_SUBSTEPS - 1) {
+          prefetchMapillaryFrames(nextIndex);
+        }
         return;
       }
 
       moveSubstepRef.current = { direction: 0, count: 0 };
       const currentFrame = mapillaryFrames[currentFrameIndex];
       const nextFrame = mapillaryFrames[nextIndex];
-      pendingMoveRef.current = true;
-      setPreviousFrameUrl(currentFrame?.imageUrl ?? null);
-      startPanoramaTransition(reverse);
-      setHasWalked(true);
-      prefetchMapillaryFrames(nextIndex);
-
-      window.setTimeout(() => {
+      playMicroStep(reverse, MOVE_SUBSTEPS, () => {
+        pendingMoveRef.current = true;
+        steeringBiasRef.current *= 0.45;
+        setPreviousFrameUrl(currentFrame?.imageUrl ?? null);
+        setHasWalked(true);
+        prefetchMapillaryFrames(nextIndex);
         setCurrentFrameIndex(nextIndex);
         setPlayerPosition({ lat: nextFrame.lat, lng: nextFrame.lng });
-      }, 130);
-
-      window.setTimeout(() => {
+        setPlayerHeading(nextFrame.heading);
         finishPanoramaTransition();
-        setPreviousFrameUrl(null);
-      }, 720);
+        window.setTimeout(() => setPreviousFrameUrl(null), 180);
+      });
       return;
     }
 
@@ -671,7 +766,9 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
 
     const currentHeading = panorama.getPov().heading;
     const desiredHeading = reverse ? currentHeading + 180 : currentHeading;
-    const route = getClosestStreetLink(links, desiredHeading);
+    const route = reverse
+      ? getClosestStreetLink(links, desiredHeading)
+      : getPreferredStreetLink(links, desiredHeading, steeringBiasRef.current);
     const direction = reverse ? -1 : 1;
     const nextSubstep =
       moveSubstepRef.current.direction === direction ? moveSubstepRef.current.count + 1 : 1;
@@ -679,24 +776,27 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
 
     if (nextSubstep < MOVE_SUBSTEPS) {
       playMicroStep(reverse, nextSubstep);
+      if (nextSubstep === MOVE_SUBSTEPS - 1) {
+        void loadPanoramaData(route.pano);
+        void prefetchRouteAhead(route.pano, route.heading, PREFETCH_FRAME_COUNT);
+        void prefetchPanoramaNeighborhood(route.pano, route.heading, PREFETCH_FRAME_COUNT);
+      }
       return;
     }
 
     moveSubstepRef.current = { direction: 0, count: 0 };
-    pendingMoveRef.current = true;
-    startPanoramaTransition(reverse);
-    setHasWalked(true);
-    void prefetchRouteAhead(route.pano, route.heading, PREFETCH_FRAME_COUNT);
-    void prefetchPanoramaNeighborhood(route.pano, route.heading, PREFETCH_FRAME_COUNT);
+    playMicroStep(reverse, MOVE_SUBSTEPS, () => {
+      pendingMoveRef.current = true;
+      steeringBiasRef.current *= 0.45;
+      setHasWalked(true);
+      void prefetchRouteAhead(route.pano, route.heading, PREFETCH_FRAME_COUNT);
+      void prefetchPanoramaNeighborhood(route.pano, route.heading, PREFETCH_FRAME_COUNT);
 
-    try {
-      await loadPanoramaData(route.pano);
-      panorama.setPano(route.pano);
-      panorama.setPov({ heading: route.heading, pitch: 0 });
-    } catch {
-      panorama.setPano(route.pano);
-      panorama.setPov({ heading: route.heading, pitch: 0 });
-    }
+      void loadPanoramaData(route.pano).finally(() => {
+        panorama.setPano(route.pano);
+        panorama.setPov({ heading: route.heading, pitch: 0 });
+      });
+    });
   }, [
     currentFrameIndex,
     finishPanoramaTransition,
@@ -707,12 +807,12 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
     prefetchMapillaryFrames,
     prefetchPanoramaNeighborhood,
     prefetchRouteAhead,
-    startPanoramaTransition,
     viewProvider,
   ]);
 
   const turnView = useCallback((amount: number) => {
     moveSubstepRef.current = { direction: 0, count: 0 };
+    steeringBiasRef.current = Math.max(-1, Math.min(1, steeringBiasRef.current + amount / 30));
     Animated.parallel([
       Animated.timing(sceneScale, {
         toValue: 1,
@@ -737,6 +837,7 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
         setPreviousFrameUrl(mapillaryFrames[currentFrameIndex]?.imageUrl ?? null);
         setCurrentFrameIndex(nextIndex);
         setPlayerPosition({ lat: mapillaryFrames[nextIndex].lat, lng: mapillaryFrames[nextIndex].lng });
+        setPlayerHeading(mapillaryFrames[nextIndex].heading);
         prefetchMapillaryFrames(nextIndex);
         window.setTimeout(() => setPreviousFrameUrl(null), 320);
       }
@@ -767,22 +868,26 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
 
       if (key === 'w' || key === 'arrowup') {
         event.preventDefault();
+        startMissionMusic();
         moveOnStreet();
       } else if (key === 's' || key === 'arrowdown') {
         event.preventDefault();
+        startMissionMusic();
         moveOnStreet(true);
       } else if (key === 'a' || key === 'arrowleft') {
         event.preventDefault();
+        startMissionMusic();
         turnView(-TURN_STEP_DEGREES);
       } else if (key === 'd' || key === 'arrowright') {
         event.preventDefault();
+        startMissionMusic();
         turnView(TURN_STEP_DEGREES);
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [moveOnStreet, turnView]);
+  }, [moveOnStreet, startMissionMusic, turnView]);
 
   useEffect(() => {
     if (!hasWalked) {
@@ -908,6 +1013,17 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
               <Text style={styles.visitedText}>
                 Visitados: {visitedPoints.size}/{touristicPoints.length}
               </Text>
+              {currentMissionPoint && (
+                <>
+                  <Text style={styles.missionText}>Missao: {currentMissionPoint.name}</Text>
+                  <Text style={styles.missionDistanceText}>{missionDistance}m ate o alvo</Text>
+                </>
+              )}
+              <TouchableOpacity style={styles.musicButton} onPress={toggleMissionMusic}>
+                <Text style={styles.musicButtonText}>
+                  {musicEnabled ? 'Musica: ON' : 'Musica: OFF'}
+                </Text>
+              </TouchableOpacity>
             </View>
             {nearbyPoint && (
               <TouchableOpacity
@@ -917,6 +1033,63 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
                 <Text style={styles.nearbyText}>Ver: {nearbyPoint.name}</Text>
               </TouchableOpacity>
             )}
+          </View>
+
+          {currentMissionPoint && (
+            <View style={styles.missionArrowContainer}>
+              <View
+                style={[
+                  styles.missionArrow,
+                  { transform: [{ rotate: `${missionArrowRotation}deg` }] },
+                ]}
+              >
+                <View style={styles.missionArrowTip} />
+                <View style={styles.missionArrowBody} />
+                <View style={styles.missionArrowWingLeft} />
+                <View style={styles.missionArrowWingRight} />
+              </View>
+              <Text style={styles.missionArrowLabel}>{currentMissionPoint.name}</Text>
+            </View>
+          )}
+
+          <View style={styles.gtaMiniMap}>
+            <View style={styles.miniMapRoadVertical} />
+            <View style={styles.miniMapRoadHorizontal} />
+            <View style={styles.miniMapRoadDiagonalA} />
+            <View style={styles.miniMapRoadDiagonalB} />
+            <Text style={[styles.compassLetter, styles.compassNorth]}>N</Text>
+            <Text style={[styles.compassLetter, styles.compassSouth]}>S</Text>
+            <Text style={[styles.compassLetter, styles.compassWest]}>O</Text>
+            <Text style={[styles.compassLetter, styles.compassEast]}>L</Text>
+            {touristicPoints.map((point) => {
+              const projected = projectToMiniMap(point.coordinates);
+              const isVisited = visitedPoints.has(point.id);
+              const isMission = currentMissionPoint?.id === point.id;
+
+              return (
+                <View
+                  key={point.id}
+                  style={[
+                    styles.miniMapPoint,
+                    projected,
+                    isVisited && styles.miniMapVisitedPoint,
+                    isMission && styles.miniMapMissionPoint,
+                  ]}
+                >
+                  <Text style={styles.miniMapPointText}>{isVisited ? '✓' : '!'}</Text>
+                </View>
+              );
+            })}
+            <View style={[styles.miniMapPlayer, playerMiniMapPosition]}>
+              <Text
+                style={[
+                  styles.miniMapPlayerArrow,
+                  { transform: [{ rotate: `${playerHeading}deg` }] },
+                ]}
+              >
+                ▲
+              </Text>
+            </View>
           </View>
 
           <Animated.View
@@ -980,7 +1153,10 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
             <TouchableOpacity
               disabled={isMoving}
               style={[styles.controlButton, isMoving && styles.disabledButton]}
-              onPress={() => turnView(-TURN_STEP_DEGREES)}
+              onPress={() => {
+                startMissionMusic();
+                turnView(-TURN_STEP_DEGREES);
+              }}
             >
               <Text style={styles.controlButtonText}>Virar E</Text>
             </TouchableOpacity>
@@ -988,14 +1164,20 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
               <TouchableOpacity
                 disabled={isMoving}
                 style={[styles.walkButton, isMoving && styles.disabledButton]}
-                onPress={() => moveOnStreet()}
+                onPress={() => {
+                  startMissionMusic();
+                  moveOnStreet();
+                }}
               >
                 <Text style={styles.controlButtonText}>Andar</Text>
               </TouchableOpacity>
               <TouchableOpacity
                 disabled={isMoving}
                 style={[styles.backButton, isMoving && styles.disabledButton]}
-                onPress={() => moveOnStreet(true)}
+                onPress={() => {
+                  startMissionMusic();
+                  moveOnStreet(true);
+                }}
               >
                 <Text style={styles.backButtonText}>Voltar</Text>
               </TouchableOpacity>
@@ -1003,7 +1185,10 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
             <TouchableOpacity
               disabled={isMoving}
               style={[styles.controlButton, isMoving && styles.disabledButton]}
-              onPress={() => turnView(TURN_STEP_DEGREES)}
+              onPress={() => {
+                startMissionMusic();
+                turnView(TURN_STEP_DEGREES);
+              }}
             >
               <Text style={styles.controlButtonText}>Virar D</Text>
             </TouchableOpacity>
@@ -1128,6 +1313,33 @@ const styles = StyleSheet.create({
   },
   scoreText: { color: '#FFD93D', fontSize: 16, fontWeight: 'bold', marginBottom: 5 },
   visitedText: { color: '#4ECDC4', fontSize: 14 },
+  missionText: {
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: 'bold',
+    marginTop: 8,
+    maxWidth: 220,
+  },
+  missionDistanceText: {
+    color: '#FFD93D',
+    fontSize: 12,
+    marginTop: 2,
+  },
+  musicButton: {
+    alignSelf: 'flex-start',
+    marginTop: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 10,
+    backgroundColor: 'rgba(255, 217, 61, 0.18)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 217, 61, 0.45)',
+  },
+  musicButtonText: {
+    color: '#FFD93D',
+    fontSize: 11,
+    fontWeight: 'bold',
+  },
   nearbyButton: {
     alignSelf: 'flex-start',
     marginTop: 10,
@@ -1137,6 +1349,180 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFD93D',
   },
   nearbyText: { color: '#283238', fontSize: 14, fontWeight: 'bold' },
+  missionArrowContainer: {
+    position: 'absolute',
+    top: 132,
+    left: '50%',
+    marginLeft: -95,
+    width: 190,
+    alignItems: 'center',
+    zIndex: 1000,
+  },
+  missionArrow: {
+    width: 52,
+    height: 52,
+    borderRadius: 26,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(0, 0, 0, 0.48)',
+    borderWidth: 3,
+    borderColor: '#FFD93D',
+  },
+  missionArrowTip: {
+    position: 'absolute',
+    top: 6,
+    width: 0,
+    height: 0,
+    borderLeftWidth: 12,
+    borderRightWidth: 12,
+    borderBottomWidth: 26,
+    borderLeftColor: 'transparent',
+    borderRightColor: 'transparent',
+    borderBottomColor: '#FFD93D',
+  },
+  missionArrowBody: {
+    position: 'absolute',
+    top: 27,
+    width: 10,
+    height: 17,
+    borderRadius: 5,
+    backgroundColor: '#FFD93D',
+  },
+  missionArrowWingLeft: {
+    position: 'absolute',
+    top: 31,
+    left: 14,
+    width: 13,
+    height: 8,
+    borderRadius: 5,
+    backgroundColor: '#FFD93D',
+    transform: [{ rotate: '-34deg' }],
+  },
+  missionArrowWingRight: {
+    position: 'absolute',
+    top: 31,
+    right: 14,
+    width: 13,
+    height: 8,
+    borderRadius: 5,
+    backgroundColor: '#FFD93D',
+    transform: [{ rotate: '34deg' }],
+  },
+  missionArrowLabel: {
+    marginTop: 7,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 12,
+    overflow: 'hidden',
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: 'bold',
+    textAlign: 'center',
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+  },
+  gtaMiniMap: {
+    position: 'absolute',
+    left: 18,
+    bottom: 18,
+    width: 168,
+    height: 168,
+    borderRadius: 84,
+    overflow: 'hidden',
+    zIndex: 1000,
+    backgroundColor: '#e8eceb',
+    borderWidth: 6,
+    borderColor: '#080808',
+  },
+  miniMapRoadVertical: {
+    position: 'absolute',
+    top: -20,
+    left: 76,
+    width: 17,
+    height: 220,
+    backgroundColor: '#222b32',
+  },
+  miniMapRoadHorizontal: {
+    position: 'absolute',
+    top: 77,
+    left: -22,
+    width: 220,
+    height: 16,
+    backgroundColor: '#222b32',
+  },
+  miniMapRoadDiagonalA: {
+    position: 'absolute',
+    top: 77,
+    left: -22,
+    width: 225,
+    height: 13,
+    backgroundColor: '#38434b',
+    transform: [{ rotate: '31deg' }],
+  },
+  miniMapRoadDiagonalB: {
+    position: 'absolute',
+    top: 73,
+    left: -25,
+    width: 220,
+    height: 12,
+    backgroundColor: '#556168',
+    transform: [{ rotate: '-28deg' }],
+  },
+  compassLetter: {
+    position: 'absolute',
+    color: '#050505',
+    fontSize: 19,
+    fontWeight: 'bold',
+    textShadowColor: '#fff',
+    textShadowOffset: { width: 1, height: 1 },
+    textShadowRadius: 2,
+  },
+  compassNorth: { top: 5, left: 76 },
+  compassSouth: { bottom: 5, left: 78 },
+  compassWest: { left: 7, top: 73 },
+  compassEast: { right: 8, top: 73 },
+  miniMapPoint: {
+    position: 'absolute',
+    width: 18,
+    height: 18,
+    marginLeft: -9,
+    marginTop: -9,
+    borderRadius: 9,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#ffcf3f',
+    borderWidth: 2,
+    borderColor: '#111',
+  },
+  miniMapMissionPoint: {
+    backgroundColor: '#ff4d4d',
+    transform: [{ scale: 1.2 }],
+  },
+  miniMapVisitedPoint: {
+    backgroundColor: '#4ECDC4',
+  },
+  miniMapPointText: {
+    color: '#111',
+    fontSize: 10,
+    fontWeight: 'bold',
+  },
+  miniMapPlayer: {
+    position: 'absolute',
+    width: 24,
+    height: 24,
+    marginLeft: -12,
+    marginTop: -12,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#fff',
+    borderWidth: 2,
+    borderColor: '#111',
+  },
+  miniMapPlayerArrow: {
+    color: '#246BFD',
+    fontSize: 15,
+    fontWeight: 'bold',
+  },
   player: {
     position: 'absolute',
     bottom: 104,

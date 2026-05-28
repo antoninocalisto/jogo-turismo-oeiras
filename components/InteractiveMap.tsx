@@ -35,6 +35,8 @@ const TURN_STEP_DEGREES = 10;
 const MOVE_SUBSTEPS = 3;
 const MINI_MAP_SIZE = 224;
 const MINI_MAP_PADDING = 22;
+const MINI_MAP_WORLD_RADIUS_METERS = 180;
+const VIRTUAL_CLICK_FORWARD_OFFSET_DEGREES = 8;
 
 const distanceInMeters = (start: PlayerPosition, point: [number, number]) => {
   const earthRadius = 6371000;
@@ -110,59 +112,27 @@ const getPreferredStreetLink = (
     return scoreLink(candidate) < scoreLink(best) ? candidate : best;
   });
 
-const miniMapBounds = touristicPoints.reduce(
-  (bounds, point) => ({
-    minLat: Math.min(bounds.minLat, point.coordinates[0]),
-    maxLat: Math.max(bounds.maxLat, point.coordinates[0]),
-    minLng: Math.min(bounds.minLng, point.coordinates[1]),
-    maxLng: Math.max(bounds.maxLng, point.coordinates[1]),
-  }),
-  {
-    minLat: INITIAL_PLAYER_POSITION.lat,
-    maxLat: INITIAL_PLAYER_POSITION.lat,
-    minLng: INITIAL_PLAYER_POSITION.lng,
-    maxLng: INITIAL_PLAYER_POSITION.lng,
-  }
-);
+const getVirtualClickHeading = (heading: number, steeringBias: number) =>
+  heading +
+  Math.max(-1, Math.min(1, steeringBias)) * VIRTUAL_CLICK_FORWARD_OFFSET_DEGREES;
 
-const projectToMiniMap = (position: PlayerPosition | [number, number]) => {
+const projectToCenteredMiniMap = (
+  position: PlayerPosition | [number, number],
+  center: PlayerPosition
+) => {
   const lat = Array.isArray(position) ? position[0] : position.lat;
   const lng = Array.isArray(position) ? position[1] : position.lng;
-  const latRange = Math.max(miniMapBounds.maxLat - miniMapBounds.minLat, 0.001);
-  const lngRange = Math.max(miniMapBounds.maxLng - miniMapBounds.minLng, 0.001);
-  const usableSize = MINI_MAP_SIZE - MINI_MAP_PADDING * 2;
+  const metersPerLatDegree = 111320;
+  const metersPerLngDegree = 111320 * Math.cos((center.lat * Math.PI) / 180);
+  const deltaX = (lng - center.lng) * metersPerLngDegree;
+  const deltaY = (lat - center.lat) * metersPerLatDegree;
+  const pixelsPerMeter = (MINI_MAP_SIZE / 2 - MINI_MAP_PADDING) / MINI_MAP_WORLD_RADIUS_METERS;
 
   return {
-    left: MINI_MAP_PADDING + ((lng - miniMapBounds.minLng) / lngRange) * usableSize,
-    top: MINI_MAP_SIZE - MINI_MAP_PADDING - ((lat - miniMapBounds.minLat) / latRange) * usableSize,
+    left: MINI_MAP_SIZE / 2 + deltaX * pixelsPerMeter,
+    top: MINI_MAP_SIZE / 2 - deltaY * pixelsPerMeter,
   };
 };
-
-const MINI_MAP_ROUTE_POINTS = touristicPoints
-  .map((point) => projectToMiniMap(point.coordinates))
-  .sort((first, second) => first.left - second.left);
-
-const buildMiniMapRoadSegments = () => {
-  const routePoints = MINI_MAP_ROUTE_POINTS.length
-    ? [projectToMiniMap(INITIAL_PLAYER_POSITION), ...MINI_MAP_ROUTE_POINTS]
-    : [projectToMiniMap(INITIAL_PLAYER_POSITION)];
-
-  return routePoints.slice(0, -1).map((start, index) => {
-    const end = routePoints[index + 1];
-    const deltaX = end.left - start.left;
-    const deltaY = end.top - start.top;
-
-    return {
-      key: `${index}-${start.left}-${end.left}`,
-      left: start.left,
-      top: start.top,
-      width: Math.sqrt(deltaX ** 2 + deltaY ** 2),
-      angle: `${Math.atan2(deltaY, deltaX)}rad`,
-    };
-  });
-};
-
-const MINI_MAP_ROAD_SEGMENTS = buildMiniMapRoadSegments();
 
 type ViewProvider = 'loading' | 'google' | 'mapillary';
 
@@ -238,7 +208,23 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
   );
   const isMissionZoneOnScreen =
     isMissionZoneVisible && Math.abs(missionArrowRotation) <= MISSION_ZONE_FIELD_OF_VIEW_DEGREES;
-  const playerMiniMapPosition = projectToMiniMap(playerPosition);
+  const playerMiniMapPosition = { left: MINI_MAP_SIZE / 2, top: MINI_MAP_SIZE / 2 };
+  const miniMapRoutePoints = [INITIAL_PLAYER_POSITION, ...touristicPoints.map((point) => point.coordinates)]
+    .map((position) => projectToCenteredMiniMap(position, playerPosition))
+    .sort((first, second) => first.left - second.left);
+  const miniMapRoadSegments = miniMapRoutePoints.slice(0, -1).map((start, index) => {
+    const end = miniMapRoutePoints[index + 1];
+    const deltaX = end.left - start.left;
+    const deltaY = end.top - start.top;
+
+    return {
+      key: `${index}-${Math.round(start.left)}-${Math.round(end.left)}`,
+      left: start.left,
+      top: start.top,
+      width: Math.sqrt(deltaX ** 2 + deltaY ** 2),
+      angle: `${Math.atan2(deltaY, deltaX)}rad`,
+    };
+  });
 
   const stopMissionMusic = useCallback(() => {
     musicAudioRef.current?.pause();
@@ -431,7 +417,12 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
     }
 
     if (links.length) {
-      const forwardRoute = getPreferredStreetLink(links, heading, steeringBiasRef.current);
+      const virtualClickHeading = getVirtualClickHeading(heading, steeringBiasRef.current);
+      const forwardRoute = getPreferredStreetLink(
+        links,
+        virtualClickHeading,
+        steeringBiasRef.current
+      );
       const backwardRoute = getClosestStreetLink(links, heading + 180);
       void prefetchRouteAhead(forwardRoute.pano, forwardRoute.heading, PREFETCH_FRAME_COUNT);
       void prefetchRouteAhead(backwardRoute.pano, backwardRoute.heading, 4);
@@ -807,7 +798,8 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
     }
 
     const currentHeading = panorama.getPov().heading;
-    const desiredHeading = reverse ? currentHeading + 180 : currentHeading;
+    const virtualClickHeading = getVirtualClickHeading(currentHeading, steeringBiasRef.current);
+    const desiredHeading = reverse ? currentHeading + 180 : virtualClickHeading;
     const route = reverse
       ? getClosestStreetLink(links, desiredHeading)
       : getPreferredStreetLink(links, desiredHeading, steeringBiasRef.current);
@@ -1107,7 +1099,7 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
           )}
 
           <View style={styles.gtaMiniMap}>
-            {MINI_MAP_ROAD_SEGMENTS.map((segment) => (
+            {miniMapRoadSegments.map((segment) => (
               <View
                 key={segment.key}
                 style={[
@@ -1122,7 +1114,7 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
               />
             ))}
             {touristicPoints.map((point) => {
-              const projected = projectToMiniMap(point.coordinates);
+              const projected = projectToCenteredMiniMap(point.coordinates, playerPosition);
 
               return (
                 <View
@@ -1136,7 +1128,7 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
             <Text style={[styles.compassLetter, styles.compassWest]}>O</Text>
             <Text style={[styles.compassLetter, styles.compassEast]}>L</Text>
             {touristicPoints.map((point) => {
-              const projected = projectToMiniMap(point.coordinates);
+              const projected = projectToCenteredMiniMap(point.coordinates, playerPosition);
               const isVisited = visitedPoints.has(point.id);
               const isMission = currentMissionPoint?.id === point.id;
 
@@ -1199,6 +1191,18 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
               <Text style={styles.missionZoneText}>MISSÃO</Text>
             </View>
           )}
+
+          <View
+            style={[
+              styles.virtualWalkTarget,
+              {
+                transform: [
+                  { translateX: steeringBiasRef.current * 34 },
+                  { rotate: `${steeringBiasRef.current * 10}deg` },
+                ],
+              },
+            ]}
+          />
 
           {isMoving && (
             <Animated.View
@@ -1679,6 +1683,19 @@ const styles = StyleSheet.create({
     textShadowColor: '#8a0000',
     textShadowOffset: { width: 1, height: 1 },
     textShadowRadius: 2,
+  },
+  virtualWalkTarget: {
+    position: 'absolute',
+    bottom: 205,
+    left: '50%',
+    marginLeft: -34,
+    width: 68,
+    height: 20,
+    borderRadius: 999,
+    zIndex: 925,
+    backgroundColor: 'rgba(255, 255, 255, 0.16)',
+    borderWidth: 3,
+    borderColor: 'rgba(255, 255, 255, 0.42)',
   },
   motionOverlay: {
     position: 'absolute',

@@ -26,12 +26,15 @@ const INITIAL_PLAYER_POSITION: PlayerPosition = {
   lng: -42.1311325,
 };
 const INTERACTION_DISTANCE_METERS = 35;
+const MISSION_ZONE_VISIBLE_METERS = 85;
+const MISSION_COMPLETE_METERS = 18;
+const MISSION_ZONE_FIELD_OF_VIEW_DEGREES = 74;
 const PREFETCH_FRAME_COUNT = 10;
 const MAPILLARY_SEARCH_RADIUS_DEGREES = 0.025;
 const TURN_STEP_DEGREES = 10;
 const MOVE_SUBSTEPS = 3;
-const MINI_MAP_SIZE = 168;
-const MINI_MAP_PADDING = 14;
+const MINI_MAP_SIZE = 224;
+const MINI_MAP_PADDING = 22;
 
 const distanceInMeters = (start: PlayerPosition, point: [number, number]) => {
   const earthRadius = 6371000;
@@ -135,6 +138,32 @@ const projectToMiniMap = (position: PlayerPosition | [number, number]) => {
   };
 };
 
+const MINI_MAP_ROUTE_POINTS = touristicPoints
+  .map((point) => projectToMiniMap(point.coordinates))
+  .sort((first, second) => first.left - second.left);
+
+const buildMiniMapRoadSegments = () => {
+  const routePoints = MINI_MAP_ROUTE_POINTS.length
+    ? [projectToMiniMap(INITIAL_PLAYER_POSITION), ...MINI_MAP_ROUTE_POINTS]
+    : [projectToMiniMap(INITIAL_PLAYER_POSITION)];
+
+  return routePoints.slice(0, -1).map((start, index) => {
+    const end = routePoints[index + 1];
+    const deltaX = end.left - start.left;
+    const deltaY = end.top - start.top;
+
+    return {
+      key: `${index}-${start.left}-${end.left}`,
+      left: start.left,
+      top: start.top,
+      width: Math.sqrt(deltaX ** 2 + deltaY ** 2),
+      angle: `${Math.atan2(deltaY, deltaX)}rad`,
+    };
+  });
+};
+
+const MINI_MAP_ROAD_SEGMENTS = buildMiniMapRoadSegments();
+
 type ViewProvider = 'loading' | 'google' | 'mapillary';
 
 interface MapillaryFrame {
@@ -193,9 +222,22 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
   const missionDistance = currentMissionPoint
     ? Math.round(distanceInMeters(playerPosition, currentMissionPoint.coordinates))
     : 0;
+  const isMissionZoneVisible =
+    Boolean(currentMissionPoint) && missionDistance <= MISSION_ZONE_VISIBLE_METERS;
+  const missionZoneScale = currentMissionPoint
+    ? Math.max(0.72, Math.min(1.18, missionDistance / MISSION_ZONE_VISIBLE_METERS + 0.45))
+    : 1;
   const missionArrowRotation = currentMissionPoint
     ? signedHeadingDifference(bearingToPoint(playerPosition, currentMissionPoint.coordinates), playerHeading)
     : 0;
+  const missionZoneHorizontalPercent =
+    50 + (missionArrowRotation / MISSION_ZONE_FIELD_OF_VIEW_DEGREES) * 46;
+  const missionZoneVerticalPercent = Math.max(
+    50,
+    Math.min(75, 72 - (MISSION_ZONE_VISIBLE_METERS - missionDistance) * 0.18)
+  );
+  const isMissionZoneOnScreen =
+    isMissionZoneVisible && Math.abs(missionArrowRotation) <= MISSION_ZONE_FIELD_OF_VIEW_DEGREES;
   const playerMiniMapPosition = projectToMiniMap(playerPosition);
 
   const stopMissionMusic = useCallback(() => {
@@ -899,20 +941,32 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
     touristicPoints.forEach((point) => {
       if (distanceInMeters(playerPosition, point.coordinates) <= INTERACTION_DISTANCE_METERS) {
         nextNearbyPoints.add(point.id);
-        if (!visitedPoints.has(point.id)) {
-          setVisitedPoints((previous) => new Set([...previous, point.id]));
-          setScore((previous) => previous + 10);
-          onPointVisited?.(point);
-
-          if (visitedPoints.size === 0) {
-            onBadgeUnlocked?.('first_step');
-          }
-        }
       }
     });
 
+    if (
+      currentMissionPoint &&
+      !visitedPoints.has(currentMissionPoint.id) &&
+      distanceInMeters(playerPosition, currentMissionPoint.coordinates) <= MISSION_COMPLETE_METERS
+    ) {
+      setVisitedPoints((previous) => new Set([...previous, currentMissionPoint.id]));
+      setScore((previous) => previous + 10);
+      onPointVisited?.(currentMissionPoint);
+
+      if (visitedPoints.size === 0) {
+        onBadgeUnlocked?.('first_step');
+      }
+    }
+
     setNearbyPoints(nextNearbyPoints);
-  }, [hasWalked, onBadgeUnlocked, onPointVisited, playerPosition, visitedPoints]);
+  }, [
+    currentMissionPoint,
+    hasWalked,
+    onBadgeUnlocked,
+    onPointVisited,
+    playerPosition,
+    visitedPoints,
+  ]);
 
   useEffect(() => {
     if (visitedPoints.size === touristicPoints.length && visitedPoints.size > 0) {
@@ -1053,10 +1107,30 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
           )}
 
           <View style={styles.gtaMiniMap}>
-            <View style={styles.miniMapRoadVertical} />
-            <View style={styles.miniMapRoadHorizontal} />
-            <View style={styles.miniMapRoadDiagonalA} />
-            <View style={styles.miniMapRoadDiagonalB} />
+            {MINI_MAP_ROAD_SEGMENTS.map((segment) => (
+              <View
+                key={segment.key}
+                style={[
+                  styles.miniMapRoadSegment,
+                  {
+                    left: segment.left,
+                    top: segment.top,
+                    width: segment.width,
+                    transform: [{ rotate: segment.angle }],
+                  },
+                ]}
+              />
+            ))}
+            {touristicPoints.map((point) => {
+              const projected = projectToMiniMap(point.coordinates);
+
+              return (
+                <View
+                  key={`cross-${point.id}`}
+                  style={[styles.miniMapRoadCross, projected]}
+                />
+              );
+            })}
             <Text style={[styles.compassLetter, styles.compassNorth]}>N</Text>
             <Text style={[styles.compassLetter, styles.compassSouth]}>S</Text>
             <Text style={[styles.compassLetter, styles.compassWest]}>O</Text>
@@ -1109,6 +1183,22 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
             </View>
             <View style={styles.playerShadow} />
           </Animated.View>
+
+          {isMissionZoneOnScreen && currentMissionPoint && (
+            <View
+              style={[
+                styles.missionZone,
+                {
+                  left: `${missionZoneHorizontalPercent}%`,
+                  top: `${missionZoneVerticalPercent}%`,
+                  transform: [{ scale: missionZoneScale }],
+                },
+              ]}
+            >
+              <View style={styles.missionZoneInner} />
+              <Text style={styles.missionZoneText}>MISSÃO</Text>
+            </View>
+          )}
 
           {isMoving && (
             <Animated.View
@@ -1424,48 +1514,35 @@ const styles = StyleSheet.create({
     position: 'absolute',
     left: 18,
     bottom: 18,
-    width: 168,
-    height: 168,
-    borderRadius: 84,
+    width: MINI_MAP_SIZE,
+    height: MINI_MAP_SIZE,
+    borderRadius: MINI_MAP_SIZE / 2,
     overflow: 'hidden',
     zIndex: 1000,
-    backgroundColor: '#e8eceb',
+    backgroundColor: '#e7ede9',
     borderWidth: 6,
     borderColor: '#080808',
   },
-  miniMapRoadVertical: {
+  miniMapRoadSegment: {
     position: 'absolute',
-    top: -20,
-    left: 76,
-    width: 17,
-    height: 220,
-    backgroundColor: '#222b32',
-  },
-  miniMapRoadHorizontal: {
-    position: 'absolute',
-    top: 77,
-    left: -22,
-    width: 220,
     height: 16,
-    backgroundColor: '#222b32',
+    marginTop: -8,
+    borderRadius: 14,
+    backgroundColor: '#28343b',
+    borderWidth: 2,
+    borderColor: '#f8f8f2',
+    transformOrigin: 'left center',
   },
-  miniMapRoadDiagonalA: {
+  miniMapRoadCross: {
     position: 'absolute',
-    top: 77,
-    left: -22,
-    width: 225,
-    height: 13,
-    backgroundColor: '#38434b',
-    transform: [{ rotate: '31deg' }],
-  },
-  miniMapRoadDiagonalB: {
-    position: 'absolute',
-    top: 73,
-    left: -25,
-    width: 220,
-    height: 12,
-    backgroundColor: '#556168',
-    transform: [{ rotate: '-28deg' }],
+    width: 30,
+    height: 30,
+    marginLeft: -15,
+    marginTop: -15,
+    borderRadius: 15,
+    backgroundColor: '#28343b',
+    borderWidth: 2,
+    borderColor: '#f8f8f2',
   },
   compassLetter: {
     position: 'absolute',
@@ -1476,10 +1553,10 @@ const styles = StyleSheet.create({
     textShadowOffset: { width: 1, height: 1 },
     textShadowRadius: 2,
   },
-  compassNorth: { top: 5, left: 76 },
-  compassSouth: { bottom: 5, left: 78 },
-  compassWest: { left: 7, top: 73 },
-  compassEast: { right: 8, top: 73 },
+  compassNorth: { top: 7, left: MINI_MAP_SIZE / 2 - 9 },
+  compassSouth: { bottom: 7, left: MINI_MAP_SIZE / 2 - 9 },
+  compassWest: { left: 10, top: MINI_MAP_SIZE / 2 - 12 },
+  compassEast: { right: 10, top: MINI_MAP_SIZE / 2 - 12 },
   miniMapPoint: {
     position: 'absolute',
     width: 18,
@@ -1571,6 +1648,37 @@ const styles = StyleSheet.create({
     borderRadius: 20,
     marginTop: -2,
     backgroundColor: 'rgba(0, 0, 0, 0.25)',
+  },
+  missionZone: {
+    position: 'absolute',
+    marginLeft: -62,
+    marginTop: -26,
+    width: 124,
+    height: 52,
+    borderRadius: 999,
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 930,
+    backgroundColor: 'rgba(255, 35, 35, 0.22)',
+    borderWidth: 4,
+    borderColor: 'rgba(255, 45, 45, 0.72)',
+  },
+  missionZoneInner: {
+    position: 'absolute',
+    width: 76,
+    height: 28,
+    borderRadius: 999,
+    backgroundColor: 'rgba(255, 55, 55, 0.25)',
+    borderWidth: 2,
+    borderColor: 'rgba(255, 255, 255, 0.55)',
+  },
+  missionZoneText: {
+    color: '#fff',
+    fontSize: 11,
+    fontWeight: 'bold',
+    textShadowColor: '#8a0000',
+    textShadowOffset: { width: 1, height: 1 },
+    textShadowRadius: 2,
   },
   motionOverlay: {
     position: 'absolute',

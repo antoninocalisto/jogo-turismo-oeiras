@@ -7,6 +7,7 @@ import {
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { touristicPoints, TouristicPoint } from '@/data/touristicPoints';
@@ -36,6 +37,7 @@ const MOVE_SUBSTEPS = 3;
 const MINI_MAP_SIZE = 224;
 const MINI_MAP_PADDING = 22;
 const MINI_MAP_WORLD_RADIUS_METERS = 180;
+const MOBILE_VIEWPORT_WIDTH = 640;
 const VIRTUAL_CLICK_FORWARD_OFFSET_DEGREES = 8;
 
 const distanceInMeters = (start: PlayerPosition, point: [number, number]) => {
@@ -150,6 +152,7 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
   onPointVisited,
   onBadgeUnlocked,
 }) => {
+  const { width } = useWindowDimensions();
   const panoramaContainerRef = useRef<any>(null);
   const panoramaRef = useRef<google.maps.StreetViewPanorama | null>(null);
   const streetViewServiceRef = useRef<google.maps.StreetViewService | null>(null);
@@ -185,6 +188,7 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
   const [score, setScore] = useState(0);
   const [playerHeading, setPlayerHeading] = useState(0);
   const [musicEnabled, setMusicEnabled] = useState(false);
+  const isMobileViewport = width <= MOBILE_VIEWPORT_WIDTH;
 
   const activeMapillaryFrame = mapillaryFrames[currentFrameIndex];
   const currentMissionPoint =
@@ -1048,25 +1052,39 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
 
       {streetViewReady && (
         <>
-          <View style={styles.overlay}>
-            <View style={styles.hud}>
-              <Text style={styles.providerText}>
+          <View style={[styles.overlay, isMobileViewport && styles.mobileOverlay]}>
+            <View style={[styles.hud, isMobileViewport && styles.mobileHud]}>
+              <Text style={[styles.providerText, isMobileViewport && styles.mobileProviderText]}>
                 {viewProvider === 'mapillary'
                   ? `Mapillary + IA visual (${mapillaryFrames.length} frames)`
                   : 'Street View com suavizacao visual'}
               </Text>
-              <Text style={styles.scoreText}>Pontos: {score}</Text>
-              <Text style={styles.visitedText}>
+              <Text style={[styles.scoreText, isMobileViewport && styles.mobileScoreText]}>
+                Pontos: {score}
+              </Text>
+              <Text style={[styles.visitedText, isMobileViewport && styles.mobileVisitedText]}>
                 Visitados: {visitedPoints.size}/{touristicPoints.length}
               </Text>
               {currentMissionPoint && (
                 <>
-                  <Text style={styles.missionText}>Missao: {currentMissionPoint.name}</Text>
-                  <Text style={styles.missionDistanceText}>{missionDistance}m ate o alvo</Text>
+                  <Text style={[styles.missionText, isMobileViewport && styles.mobileMissionText]}>
+                    Missao: {currentMissionPoint.name}
+                  </Text>
+                  <Text
+                    style={[
+                      styles.missionDistanceText,
+                      isMobileViewport && styles.mobileMissionDistanceText,
+                    ]}
+                  >
+                    {missionDistance}m ate o alvo
+                  </Text>
                 </>
               )}
-              <TouchableOpacity style={styles.musicButton} onPress={toggleMissionMusic}>
-                <Text style={styles.musicButtonText}>
+              <TouchableOpacity
+                style={[styles.musicButton, isMobileViewport && styles.mobileMusicButton]}
+                onPress={toggleMissionMusic}
+              >
+                <Text style={[styles.musicButtonText, isMobileViewport && styles.mobileMusicButtonText]}>
                   {musicEnabled ? 'Musica: ON' : 'Musica: OFF'}
                 </Text>
               </TouchableOpacity>
@@ -1098,7 +1116,7 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
             </View>
           )}
 
-          <View style={styles.gtaMiniMap}>
+          <View style={[styles.gtaMiniMap, isMobileViewport && styles.mobileGtaMiniMap]}>
             {miniMapRoadSegments.map((segment) => (
               <View
                 key={segment.key}
@@ -1392,6 +1410,7 @@ const styles = StyleSheet.create({
     marginTop: 15,
   },
   overlay: { position: 'absolute', top: 18, left: 18, right: 18, zIndex: 1000 },
+  mobileOverlay: { top: 12, left: 12, right: 12 },
   hud: {
     alignSelf: 'flex-start',
     backgroundColor: 'rgba(18, 27, 31, 0.8)',
@@ -1399,14 +1418,23 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     borderRadius: 16,
   },
+  mobileHud: {
+    paddingHorizontal: 11,
+    paddingVertical: 8,
+    borderRadius: 11,
+    maxWidth: 170,
+  },
   providerText: {
     color: '#fff',
     fontSize: 12,
     fontWeight: 'bold',
     marginBottom: 6,
   },
+  mobileProviderText: { fontSize: 8, marginBottom: 4 },
   scoreText: { color: '#FFD93D', fontSize: 16, fontWeight: 'bold', marginBottom: 5 },
+  mobileScoreText: { fontSize: 11, marginBottom: 3 },
   visitedText: { color: '#4ECDC4', fontSize: 14 },
+  mobileVisitedText: { fontSize: 9 },
   missionText: {
     color: '#fff',
     fontSize: 12,
@@ -1414,11 +1442,17 @@ const styles = StyleSheet.create({
     marginTop: 8,
     maxWidth: 220,
   },
+  mobileMissionText: {
+    fontSize: 8,
+    marginTop: 5,
+    maxWidth: 150,
+  },
   missionDistanceText: {
     color: '#FFD93D',
     fontSize: 12,
     marginTop: 2,
   },
+  mobileMissionDistanceText: { fontSize: 8, marginTop: 1 },
   musicButton: {
     alignSelf: 'flex-start',
     marginTop: 8,
@@ -1429,11 +1463,18 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: 'rgba(255, 217, 61, 0.45)',
   },
+  mobileMusicButton: {
+    marginTop: 5,
+    paddingHorizontal: 7,
+    paddingVertical: 4,
+    borderRadius: 7,
+  },
   musicButtonText: {
     color: '#FFD93D',
     fontSize: 11,
     fontWeight: 'bold',
   },
+  mobileMusicButtonText: { fontSize: 8 },
   nearbyButton: {
     alignSelf: 'flex-start',
     marginTop: 10,
@@ -1526,6 +1567,12 @@ const styles = StyleSheet.create({
     backgroundColor: '#e7ede9',
     borderWidth: 6,
     borderColor: '#080808',
+  },
+  mobileGtaMiniMap: {
+    left: 12,
+    bottom: 12,
+    transform: [{ scale: 0.67 }],
+    transformOrigin: 'bottom left',
   },
   miniMapRoadSegment: {
     position: 'absolute',

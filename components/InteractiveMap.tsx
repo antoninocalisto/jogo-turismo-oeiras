@@ -42,6 +42,7 @@ const MOBILE_VIEWPORT_WIDTH = 640;
 const VIRTUAL_CLICK_FORWARD_OFFSET_DEGREES = 8;
 const JOYSTICK_RADIUS = 24;
 const JOYSTICK_ACTION_THRESHOLD = 18;
+const JOYSTICK_REPEAT_INTERVAL_MS = 1000;
 
 const distanceInMeters = (start: PlayerPosition, point: [number, number]) => {
   const earthRadius = 6371000;
@@ -170,6 +171,7 @@ const projectToCenteredMiniMap = (
 };
 
 type ViewProvider = 'loading' | 'google' | 'mapillary';
+type JoystickAction = 'forward' | 'backward' | 'left' | 'right';
 
 interface MapillaryFrame {
   id: string;
@@ -197,6 +199,9 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
   const steeringBiasRef = useRef(0);
   const pendingMoveRef = useRef(false);
   const transitionTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const joystickIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const joystickActionRef = useRef<JoystickAction | null>(null);
+  const isMovingRef = useRef(false);
   const musicAudioRef = useRef<HTMLAudioElement | null>(null);
   const musicContextRef = useRef<AudioContext | null>(null);
   const walkAnimation = useRef(new Animated.Value(0)).current;
@@ -223,6 +228,10 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
   const [playerHeading, setPlayerHeading] = useState(0);
   const [musicEnabled, setMusicEnabled] = useState(false);
   const isMobileViewport = width <= MOBILE_VIEWPORT_WIDTH;
+
+  useEffect(() => {
+    isMovingRef.current = isMoving;
+  }, [isMoving]);
 
   const activeMapillaryFrame = mapillaryFrames[currentFrameIndex];
   const currentMissionPoint =
@@ -952,26 +961,64 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
     }).start();
   }, [joystickOffset]);
 
-  const runJoystickAction = useCallback(
-    (dx: number, dy: number) => {
-      if (isMoving) {
-        return;
-      }
+  const getJoystickAction = useCallback((dx: number, dy: number): JoystickAction | null => {
+    if (Math.max(Math.abs(dx), Math.abs(dy)) < JOYSTICK_ACTION_THRESHOLD) {
+      return null;
+    }
 
-      if (Math.max(Math.abs(dx), Math.abs(dy)) < JOYSTICK_ACTION_THRESHOLD) {
+    if (Math.abs(dy) > Math.abs(dx)) {
+      return dy > 0 ? 'backward' : 'forward';
+    }
+
+    return dx > 0 ? 'right' : 'left';
+  }, []);
+
+  const runJoystickAction = useCallback(
+    (action: JoystickAction | null) => {
+      if (!action || isMovingRef.current) {
         return;
       }
 
       startMissionMusic();
 
-      if (Math.abs(dy) > Math.abs(dx)) {
-        moveOnStreet(dy > 0);
+      if (action === 'forward' || action === 'backward') {
+        moveOnStreet(action === 'backward');
         return;
       }
 
-      turnView(dx > 0 ? TURN_STEP_DEGREES : -TURN_STEP_DEGREES);
+      turnView(action === 'right' ? TURN_STEP_DEGREES : -TURN_STEP_DEGREES);
     },
-    [isMoving, moveOnStreet, startMissionMusic, turnView]
+    [moveOnStreet, startMissionMusic, turnView]
+  );
+
+  const stopJoystickHold = useCallback(() => {
+    if (joystickIntervalRef.current) {
+      clearInterval(joystickIntervalRef.current);
+      joystickIntervalRef.current = null;
+    }
+
+    joystickActionRef.current = null;
+  }, []);
+
+  const startJoystickHold = useCallback(
+    (action: JoystickAction | null) => {
+      if (!action) {
+        stopJoystickHold();
+        return;
+      }
+
+      if (joystickActionRef.current === action && joystickIntervalRef.current) {
+        return;
+      }
+
+      stopJoystickHold();
+      joystickActionRef.current = action;
+      runJoystickAction(action);
+      joystickIntervalRef.current = setInterval(() => {
+        runJoystickAction(joystickActionRef.current);
+      }, JOYSTICK_REPEAT_INTERVAL_MS);
+    },
+    [runJoystickAction, stopJoystickHold]
   );
 
   const joystickPanResponder = useMemo(
@@ -981,10 +1028,6 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
           Math.abs(gesture.dx) > 4 || Math.abs(gesture.dy) > 4,
         onStartShouldSetPanResponder: () => true,
         onPanResponderMove: (_, gesture) => {
-          if (isMoving) {
-            return;
-          }
-
           const distance = Math.min(
             JOYSTICK_RADIUS,
             Math.sqrt(gesture.dx ** 2 + gesture.dy ** 2)
@@ -995,14 +1038,37 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
             x: Math.cos(angle) * distance,
             y: Math.sin(angle) * distance,
           });
+          startJoystickHold(getJoystickAction(gesture.dx, gesture.dy));
         },
         onPanResponderRelease: (_, gesture) => {
-          runJoystickAction(gesture.dx, gesture.dy);
+          const wasHolding = Boolean(joystickIntervalRef.current);
+          if (!wasHolding) {
+            runJoystickAction(getJoystickAction(gesture.dx, gesture.dy));
+          }
+
+          stopJoystickHold();
           resetJoystick();
         },
-        onPanResponderTerminate: resetJoystick,
+        onPanResponderTerminate: () => {
+          stopJoystickHold();
+          resetJoystick();
+        },
       }),
-    [isMoving, joystickOffset, resetJoystick, runJoystickAction]
+    [
+      getJoystickAction,
+      joystickOffset,
+      resetJoystick,
+      runJoystickAction,
+      startJoystickHold,
+      stopJoystickHold,
+    ]
+  );
+
+  useEffect(
+    () => () => {
+      stopJoystickHold();
+    },
+    [stopJoystickHold]
   );
 
   useEffect(() => {

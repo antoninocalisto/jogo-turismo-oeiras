@@ -1041,24 +1041,26 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
           startJoystickHold(getJoystickAction(gesture.dx, gesture.dy));
         },
         onPanResponderRelease: (_, gesture) => {
-          const wasHolding = Boolean(joystickIntervalRef.current);
-          if (!wasHolding) {
-            runJoystickAction(getJoystickAction(gesture.dx, gesture.dy));
+          const action = getJoystickAction(gesture.dx, gesture.dy);
+
+          if (!action) {
+            stopJoystickHold();
+            resetJoystick();
+            return;
           }
 
-          stopJoystickHold();
-          resetJoystick();
+          startJoystickHold(action);
         },
         onPanResponderTerminate: () => {
-          stopJoystickHold();
-          resetJoystick();
+          if (!joystickActionRef.current) {
+            resetJoystick();
+          }
         },
       }),
     [
       getJoystickAction,
       joystickOffset,
       resetJoystick,
-      runJoystickAction,
       startJoystickHold,
       stopJoystickHold,
     ]

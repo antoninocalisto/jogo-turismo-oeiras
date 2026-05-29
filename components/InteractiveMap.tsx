@@ -1300,49 +1300,59 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
             </Animated.View>
           )}
 
-          <View style={styles.streetControls}>
+          <View
+            style={[
+              styles.controlConsole,
+              isMoving && styles.disabledButton,
+              isMobileViewport && styles.mobileControlConsole,
+            ]}
+          >
             <TouchableOpacity
               disabled={isMoving}
-              style={[styles.controlButton, isMoving && styles.disabledButton]}
+              accessibilityLabel="Andar"
+              style={[styles.consoleButton, styles.consoleButtonTop]}
+              onPress={() => {
+                startMissionMusic();
+                moveOnStreet();
+              }}
+            >
+              <Text style={styles.consoleArrow}>^</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              disabled={isMoving}
+              accessibilityLabel="Virar para a esquerda"
+              style={[styles.consoleButton, styles.consoleButtonLeft]}
               onPress={() => {
                 startMissionMusic();
                 turnView(-TURN_STEP_DEGREES);
               }}
             >
-              <Text style={styles.controlButtonText}>Virar E</Text>
+              <Text style={styles.consoleArrow}>{'<'}</Text>
             </TouchableOpacity>
-            <View>
-              <TouchableOpacity
-                disabled={isMoving}
-                style={[styles.walkButton, isMoving && styles.disabledButton]}
-                onPress={() => {
-                  startMissionMusic();
-                  moveOnStreet();
-                }}
-              >
-                <Text style={styles.controlButtonText}>Andar</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                disabled={isMoving}
-                style={[styles.backButton, isMoving && styles.disabledButton]}
-                onPress={() => {
-                  startMissionMusic();
-                  moveOnStreet(true);
-                }}
-              >
-                <Text style={styles.backButtonText}>Voltar</Text>
-              </TouchableOpacity>
-            </View>
             <TouchableOpacity
               disabled={isMoving}
-              style={[styles.controlButton, isMoving && styles.disabledButton]}
+              accessibilityLabel="Virar para a direita"
+              style={[styles.consoleButton, styles.consoleButtonRight]}
               onPress={() => {
                 startMissionMusic();
                 turnView(TURN_STEP_DEGREES);
               }}
             >
-              <Text style={styles.controlButtonText}>Virar D</Text>
+              <Text style={styles.consoleArrow}>{'>'}</Text>
             </TouchableOpacity>
+            <TouchableOpacity
+              disabled={isMoving}
+              accessibilityLabel="Voltar"
+              style={[styles.consoleButton, styles.consoleButtonBottom]}
+              onPress={() => {
+                startMissionMusic();
+                moveOnStreet(true);
+              }}
+            >
+              <Text style={styles.consoleArrow}>v</Text>
+            </TouchableOpacity>
+            <View style={styles.consoleCenter} />
+            <Text style={styles.consoleLabel}>DESISTIR</Text>
           </View>
         </>
       )}
@@ -1841,39 +1851,68 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0, 0, 0, 0.28)',
     marginBottom: 120,
   },
-  streetControls: {
+  controlConsole: {
     position: 'absolute',
-    bottom: 22,
-    alignSelf: 'center',
-    flexDirection: 'row',
+    right: 22,
+    bottom: 28,
+    width: 148,
+    height: 148,
+    borderRadius: 74,
     alignItems: 'center',
-    gap: 8,
+    justifyContent: 'center',
     zIndex: 1000,
+    backgroundColor: 'rgba(24, 30, 34, 0.32)',
+    borderWidth: 2,
+    borderColor: 'rgba(255, 255, 255, 0.22)',
   },
-  controlButton: {
-    backgroundColor: 'rgba(18, 27, 31, 0.82)',
-    paddingHorizontal: 14,
-    paddingVertical: 13,
-    borderRadius: 14,
+  mobileControlConsole: {
+    right: 12,
+    bottom: 12,
+    transform: [{ scale: 0.72 }],
+    transformOrigin: 'bottom right',
   },
-  walkButton: {
-    backgroundColor: '#FF6B6B',
-    paddingHorizontal: 22,
-    paddingVertical: 12,
-    borderRadius: 14,
-    marginBottom: 4,
-  },
-  backButton: {
+  consoleButton: {
+    position: 'absolute',
+    width: 42,
+    height: 42,
+    borderRadius: 21,
     alignItems: 'center',
-    backgroundColor: 'rgba(18, 27, 31, 0.82)',
-    paddingVertical: 7,
-    borderRadius: 10,
+    justifyContent: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.06)',
+  },
+  consoleButtonTop: { top: 13, left: 53 },
+  consoleButtonLeft: { left: 13, top: 53 },
+  consoleButtonRight: { right: 13, top: 53 },
+  consoleButtonBottom: { bottom: 13, left: 53 },
+  consoleCenter: {
+    width: 58,
+    height: 58,
+    borderRadius: 29,
+    backgroundColor: 'rgba(184, 190, 188, 0.72)',
+    borderWidth: 3,
+    borderColor: 'rgba(38, 43, 46, 0.34)',
+    shadowColor: '#000',
+    shadowOpacity: 0.35,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 2 },
+  },
+  consoleArrow: {
+    color: 'rgba(255, 255, 255, 0.68)',
+    fontSize: 22,
+    fontWeight: 'bold',
+    lineHeight: 26,
+  },
+  consoleLabel: {
+    position: 'absolute',
+    top: 18,
+    right: 23,
+    color: 'rgba(255, 255, 255, 0.78)',
+    fontSize: 9,
+    fontWeight: 'bold',
   },
   disabledButton: {
     opacity: 0.55,
   },
-  controlButtonText: { fontSize: 14, color: '#fff', fontWeight: 'bold' },
-  backButtonText: { fontSize: 12, color: '#fff', fontWeight: 'bold' },
   modalContainer: {
     flex: 1,
     backgroundColor: 'rgba(0, 0, 0, 0.5)',

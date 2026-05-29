@@ -1270,6 +1270,15 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
             )}
           </View>
 
+          <View style={[styles.trophyBadge, isMobileViewport && styles.mobileTrophyBadge]}>
+            <Text style={[styles.trophyIcon, isMobileViewport && styles.mobileTrophyIcon]}>
+              🏆
+            </Text>
+            <Text style={[styles.trophyCount, isMobileViewport && styles.mobileTrophyCount]}>
+              (1)
+            </Text>
+          </View>
+
           {currentMissionPoint && (
             <View style={styles.missionArrowContainer}>
               <View
@@ -1669,6 +1678,52 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
   },
   mobileMusicButtonText: { fontSize: 8 },
+  trophyBadge: {
+    position: 'absolute',
+    top: 18,
+    right: 18,
+    minWidth: 92,
+    height: 42,
+    borderTopLeftRadius: 0,
+    borderTopRightRadius: 0,
+    borderBottomLeftRadius: 18,
+    borderBottomRightRadius: 18,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    zIndex: 1000,
+    backgroundColor: '#FFD44F',
+    shadowColor: '#000',
+    shadowOpacity: 0.22,
+    shadowRadius: 5,
+    shadowOffset: { width: 0, height: 2 },
+  },
+  mobileTrophyBadge: {
+    top: 12,
+    right: 12,
+    minWidth: 76,
+    height: 34,
+    borderBottomLeftRadius: 14,
+    borderBottomRightRadius: 14,
+    gap: 6,
+  },
+  trophyIcon: {
+    fontSize: 20,
+    lineHeight: 24,
+  },
+  mobileTrophyIcon: {
+    fontSize: 16,
+    lineHeight: 20,
+  },
+  trophyCount: {
+    color: '#161616',
+    fontSize: 18,
+    fontWeight: 'bold',
+  },
+  mobileTrophyCount: {
+    fontSize: 15,
+  },
   nearbyButton: {
     alignSelf: 'flex-start',
     marginTop: 10,

@@ -80,6 +80,36 @@ const getStreetLinks = (links?: (google.maps.StreetViewLink | null)[] | null) =>
       Boolean(link?.pano) && typeof link?.heading === 'number'
   );
 
+type StreetViewRequest =
+  | google.maps.StreetViewLocationRequest
+  | google.maps.StreetViewPanoRequest;
+
+const requestStreetViewPanorama = (
+  service: google.maps.StreetViewService,
+  request: StreetViewRequest
+) =>
+  new Promise<google.maps.StreetViewPanoramaData | null>((resolve) => {
+    let settled = false;
+    const settle = (data: google.maps.StreetViewPanoramaData | null) => {
+      if (!settled) {
+        settled = true;
+        resolve(data);
+      }
+    };
+
+    try {
+      const maybeRequest = service.getPanorama(request, (data, status) => {
+        settle(status === 'OK' ? data ?? null : null);
+      }) as Promise<{ data?: google.maps.StreetViewPanoramaData }> | undefined;
+
+      if (maybeRequest && typeof maybeRequest.then === 'function') {
+        maybeRequest.then((response) => settle(response.data ?? null)).catch(() => settle(null));
+      }
+    } catch {
+      settle(null);
+    }
+  });
+
 const getClosestStreetLink = (
   links: (google.maps.StreetViewLink & { pano: string; heading: number })[],
   desiredHeading: number
@@ -325,11 +355,13 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
       return null;
     }
 
-    const request = service
-      .getPanorama({ pano })
-      .then((response) => {
-        panoramaCacheRef.current.set(pano, response.data);
-        return response.data;
+    const request = requestStreetViewPanorama(service, { pano })
+      .then((data) => {
+        if (data) {
+          panoramaCacheRef.current.set(pano, data);
+        }
+
+        return data;
       })
       .catch(() => null)
       .finally(() => {
@@ -640,19 +672,26 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
           await importLibrary('streetView');
         const service = new StreetViewService();
         streetViewServiceRef.current = service;
-        const response = await service.getPanorama({
+        const panoramaData = await requestStreetViewPanorama(service, {
           location: INITIAL_PLAYER_POSITION,
           preference: StreetViewPreference.NEAREST,
           radius: 1000,
           sources: [StreetViewSource.OUTDOOR],
         });
 
-        if (!active || !response.data.location?.pano) {
+        if (!active) {
+          return;
+        }
+
+        if (!panoramaData?.location?.pano) {
+          setStreetViewError(
+            'Nao foi possivel carregar o Street View. Confira as restricoes de dominio da chave no Google Cloud.'
+          );
           return;
         }
 
         const panorama = new StreetViewPanorama(panoramaContainerRef.current, {
-          pano: response.data.location.pano,
+          pano: panoramaData.location.pano,
           pov: { heading: 0, pitch: 0 },
           zoom: 1,
           addressControl: false,
@@ -669,7 +708,7 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
         });
 
         panoramaRef.current = panorama;
-        panoramaCacheRef.current.set(response.data.location.pano, response.data);
+        panoramaCacheRef.current.set(panoramaData.location.pano, panoramaData);
         setViewProvider('google');
         setPlayerHeading(panorama.getPov().heading);
         positionListener = panorama.addListener('position_changed', () => {

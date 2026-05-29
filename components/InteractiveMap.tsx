@@ -1,9 +1,10 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Animated,
   Image,
   Modal,
+  PanResponder,
   StyleSheet,
   Text,
   TouchableOpacity,
@@ -39,6 +40,8 @@ const MINI_MAP_PADDING = 22;
 const MINI_MAP_WORLD_RADIUS_METERS = 180;
 const MOBILE_VIEWPORT_WIDTH = 640;
 const VIRTUAL_CLICK_FORWARD_OFFSET_DEGREES = 8;
+const JOYSTICK_RADIUS = 24;
+const JOYSTICK_ACTION_THRESHOLD = 18;
 
 const distanceInMeters = (start: PlayerPosition, point: [number, number]) => {
   const earthRadius = 6371000;
@@ -202,6 +205,7 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
   const sceneScale = useRef(new Animated.Value(1)).current;
   const sceneShift = useRef(new Animated.Value(0)).current;
   const aiBlend = useRef(new Animated.Value(0)).current;
+  const joystickOffset = useRef(new Animated.ValueXY({ x: 0, y: 0 })).current;
   const [streetViewReady, setStreetViewReady] = useState(false);
   const [streetViewError, setStreetViewError] = useState<string | null>(null);
   const [viewProvider, setViewProvider] = useState<ViewProvider>('loading');
@@ -939,6 +943,68 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
     viewProvider,
   ]);
 
+  const resetJoystick = useCallback(() => {
+    Animated.spring(joystickOffset, {
+      toValue: { x: 0, y: 0 },
+      friction: 5,
+      tension: 110,
+      useNativeDriver: false,
+    }).start();
+  }, [joystickOffset]);
+
+  const runJoystickAction = useCallback(
+    (dx: number, dy: number) => {
+      if (isMoving) {
+        return;
+      }
+
+      if (Math.max(Math.abs(dx), Math.abs(dy)) < JOYSTICK_ACTION_THRESHOLD) {
+        return;
+      }
+
+      startMissionMusic();
+
+      if (Math.abs(dy) > Math.abs(dx)) {
+        moveOnStreet(dy > 0);
+        return;
+      }
+
+      turnView(dx > 0 ? TURN_STEP_DEGREES : -TURN_STEP_DEGREES);
+    },
+    [isMoving, moveOnStreet, startMissionMusic, turnView]
+  );
+
+  const joystickPanResponder = useMemo(
+    () =>
+      PanResponder.create({
+        onMoveShouldSetPanResponder: (_, gesture) =>
+          Math.abs(gesture.dx) > 4 || Math.abs(gesture.dy) > 4,
+        onStartShouldSetPanResponder: () => true,
+        onPanResponderMove: (_, gesture) => {
+          if (isMoving) {
+            return;
+          }
+
+          const distance = Math.min(
+            JOYSTICK_RADIUS,
+            Math.sqrt(gesture.dx ** 2 + gesture.dy ** 2)
+          );
+          const angle = Math.atan2(gesture.dy, gesture.dx);
+
+          joystickOffset.setValue({
+            x: Math.cos(angle) * distance,
+            y: Math.sin(angle) * distance,
+          });
+        },
+        onPanResponderRelease: (_, gesture) => {
+          runJoystickAction(gesture.dx, gesture.dy);
+          resetJoystick();
+        },
+        onPanResponderTerminate: resetJoystick,
+      }),
+    [isMoving, joystickOffset, resetJoystick, runJoystickAction]
+  );
+
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       const key = event.key.toLowerCase();
@@ -1351,7 +1417,20 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
             >
               <Text style={styles.consoleArrow}>v</Text>
             </TouchableOpacity>
-            <View style={styles.consoleCenter} />
+            <Animated.View
+              {...joystickPanResponder.panHandlers}
+              style={[
+                styles.consoleCenter,
+                {
+                  transform: [
+                    { translateX: joystickOffset.x },
+                    { translateY: joystickOffset.y },
+                  ],
+                },
+              ]}
+            >
+              <View style={styles.consoleStick} />
+            </Animated.View>
             <Text style={styles.consoleLabel}>DESISTIR</Text>
           </View>
         </>
@@ -1885,9 +1964,12 @@ const styles = StyleSheet.create({
   consoleButtonRight: { right: 13, top: 53 },
   consoleButtonBottom: { bottom: 13, left: 53 },
   consoleCenter: {
+    position: 'absolute',
     width: 58,
     height: 58,
     borderRadius: 29,
+    alignItems: 'center',
+    justifyContent: 'center',
     backgroundColor: 'rgba(184, 190, 188, 0.72)',
     borderWidth: 3,
     borderColor: 'rgba(38, 43, 46, 0.34)',
@@ -1895,6 +1977,14 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.35,
     shadowRadius: 6,
     shadowOffset: { width: 0, height: 2 },
+  },
+  consoleStick: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: 'rgba(105, 112, 112, 0.72)',
+    borderWidth: 2,
+    borderColor: 'rgba(255, 255, 255, 0.22)',
   },
   consoleArrow: {
     color: 'rgba(255, 255, 255, 0.68)',
